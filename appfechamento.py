@@ -80,28 +80,53 @@ try:
     client = get_google_client()
     sheet = client.open_by_url(URL_BANCO_DADOS)
     
+    # Aba Query 2025
     ws_lanc = sheet.worksheet("Query 2025").get_all_values()
     df_lanc = pd.DataFrame(ws_lanc[1:], columns=ws_lanc[0]) if ws_lanc and len(ws_lanc) > 1 else pd.DataFrame()
         
+    # Aba Budget
     ws_budget = sheet.worksheet("Budget").get_all_values()
     df_budget = pd.DataFrame(ws_budget[1:], columns=ws_budget[0]) if ws_budget and len(ws_budget) > 1 else pd.DataFrame()
     
     # Tratamento Lançamentos
     if not df_lanc.empty:
-        df_lanc["Realizado"] = df_lanc.get("Débito/crédito (MC)", pd.Series()).apply(normalizar_valor)
-        coluna_mes_l = "Mês" if "Mês" in df_lanc.columns else "MÊS"
-        df_lanc["Data NF"] = pd.to_datetime(df_lanc.get(coluna_mes_l), errors='coerce')
-        df_lanc["Competência"] = df_lanc["Data NF"].dt.strftime('%m/%Y')
-        df_lanc["CONTA"] = df_lanc.get("Cta.contáb./cód.PN", pd.Series()).astype(str).str.strip()
-        df_lanc["Fornecedor"] = df_lanc.get("Fornecedor", pd.Series()).astype(str).str.strip()
+        colunas_upper_l = [str(c).strip().upper() for c in df_lanc.columns]
         
-    # Tratamento Budget
+        # Encontra coluna de Valor
+        col_val_l = df_lanc.columns[colunas_upper_l.index("DÉBITO/CRÉDITO (MC)")] if "DÉBITO/CRÉDITO (MC)" in colunas_upper_l else df_lanc.columns[0]
+        df_lanc["Realizado"] = df_lanc[col_val_l].apply(normalizar_valor)
+        
+        # Encontra coluna de Mês
+        col_mes_l = next((c for c, c_up in zip(df_lanc.columns, colunas_upper_l) if c_up in ['MÊS', 'MES', 'DATA']), None)
+        if col_mes_l:
+            df_lanc["Data_Temp"] = pd.to_datetime(df_lanc[col_mes_l], errors='coerce')
+            df_lanc["Competência"] = df_lanc["Data_Temp"].dt.strftime('%m/%Y').fillna(df_lanc[col_mes_l].astype(str).str.strip())
+        else:
+            df_lanc["Competência"] = "Sem Data"
+            
+        # Encontra coluna de Conta
+        col_conta_l = next((c for c, c_up in zip(df_lanc.columns, colunas_upper_l) if c_up in ['CTA.CONTÁB./CÓD.PN', 'CONTA', 'CONTA SAP']), None)
+        df_lanc["CONTA"] = df_lanc[col_conta_l].astype(str).str.strip() if col_conta_l else "Sem Conta"
+
+    # Tratamento Budget (Busca Inteligente)
     if not df_budget.empty:
-        df_budget["Orçado"] = df_budget.get("BUDGET", pd.Series()).apply(normalizar_valor)
-        # Permite flexibilidade de nome "Mês" ou "MÊS" na aba de budget
-        coluna_mes_b = "MÊS" if "MÊS" in df_budget.columns else "Mês"
-        df_budget["Competência"] = pd.to_datetime(df_budget.get(coluna_mes_b), dayfirst=True, errors='coerce').dt.strftime('%m/%Y')
-        df_budget["CONTA"] = df_budget.get("CONTA", pd.Series()).astype(str).str.strip()
+        colunas_upper_b = [str(c).strip().upper() for c in df_budget.columns]
+        
+        # 1. Achar coluna de Valor (Budget)
+        col_valor_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['BUDGET', 'ORÇADO', 'ORCAMENTO', 'VALOR']), None)
+        df_budget["Orçado"] = df_budget[col_valor_b].apply(normalizar_valor) if col_valor_b else 0.0
+        
+        # 2. Achar coluna de Mês
+        col_mes_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['MÊS', 'MES', 'DATA', 'COMPETÊNCIA', 'PERÍODO']), None)
+        if col_mes_b:
+            df_budget["Data_Temp"] = pd.to_datetime(df_budget[col_mes_b], errors='coerce')
+            df_budget["Competência"] = df_budget["Data_Temp"].dt.strftime('%m/%Y').fillna(df_budget[col_mes_b].astype(str).str.strip())
+        else:
+            df_budget["Competência"] = "Sem Data"
+            
+        # 3. Achar coluna de Conta
+        col_conta_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['CONTA', 'CONTA SAP', 'CÓDIGO', 'CTA.CONTÁB./CÓD.PN']), None)
+        df_budget["CONTA"] = df_budget[col_conta_b].astype(str).str.strip() if col_conta_b else "Sem Conta"
 
 except Exception as e:
     st.error(f"Falha ao conectar com a Planilha. Erro: {e}")
@@ -118,13 +143,11 @@ with tab1:
         st.markdown("### 🎛️ Parâmetros do Painel")
         col_f1, col_f2 = st.columns([1, 2])
         
-        # O PULO DO GATO: Unir os meses do Realizado e do Orçado
         meses_lanc = df_lanc["Competência"].dropna().unique().tolist() if not df_lanc.empty else []
         meses_bud = df_budget["Competência"].dropna().unique().tolist() if not df_budget.empty else []
         
-        # Junta tudo, remove repetidos e valores em branco (NaT)
         meses_dash = sorted(list(set(meses_lanc + meses_bud)))
-        meses_dash = [m for m in meses_dash if m != 'NaT' and str(m).strip() != 'nan' and str(m).strip() != '']
+        meses_dash = [m for m in meses_dash if m != 'NaT' and str(m).strip() not in ['nan', '', 'Sem Data']]
         
         with col_f1:
             mes_alvo = st.selectbox("📅 Competência:", meses_dash, index=len(meses_dash)-1 if meses_dash else 0)
@@ -137,8 +160,10 @@ with tab1:
         b_mes = df_budget[df_budget["Competência"] == mes_alvo].copy() if not df_budget.empty else pd.DataFrame(columns=["CONTA", "Orçado"])
         l_mes = df_lanc[df_lanc["Competência"] == mes_alvo].copy() if not df_lanc.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
+        b_grp = b_mes.groupby("CONTA")["Orçado"].sum().reset_index() if not b_mes.empty else pd.DataFrame(columns=["CONTA", "Orçado"])
         l_grp = l_mes.groupby("CONTA")["Realizado"].sum().reset_index() if not l_mes.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
-        df_bi = pd.merge(b_mes, l_grp, on="CONTA", how="outer").fillna(0) # 'outer' para mostrar contas que só tem gasto mas não tem budget
+        
+        df_bi = pd.merge(b_grp, l_grp, on="CONTA", how="outer").fillna(0)
         df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
         
         tot_orc = df_bi["Orçado"].sum()
@@ -204,7 +229,6 @@ with tab1:
 # ==========================================
 with tab2:
     st.markdown("### Lançamento Unitário no ERP (Query 2025)")
-    st.caption("Ao preencher, o sistema preencherá automaticamente as colunas da folha.")
     
     with st.form("form_novo_lancamento", clear_on_submit=True):
         c1, c2 = st.columns(2)
