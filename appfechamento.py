@@ -40,12 +40,11 @@ def get_google_client():
 
 # --- 3. MOTOR DE NORMALIZAÇÃO DE DADOS ---
 def normalizar_valor(val):
-    """Lê qualquer formato numérico/moeda e converte para float do Python"""
     if pd.isna(val) or val == "": return 0.0
     if isinstance(val, (int, float)): return float(val)
     
     s = str(val).upper().replace("R$", "").strip()
-    s = ''.join(c for c in s if c.isdigit() or c in '.,-') # Mantém sinal negativo
+    s = ''.join(c for c in s if c.isdigit() or c in '.,-') 
     if not s or s == '-': return 0.0
     
     qtd_pontos = s.count('.')
@@ -81,28 +80,27 @@ try:
     client = get_google_client()
     sheet = client.open_by_url(URL_BANCO_DADOS)
     
-    # Aba Query 2025 (Novo nome atualizado)
     ws_lanc = sheet.worksheet("Query 2025").get_all_values()
     df_lanc = pd.DataFrame(ws_lanc[1:], columns=ws_lanc[0]) if ws_lanc and len(ws_lanc) > 1 else pd.DataFrame()
         
-    # Aba Budget
     ws_budget = sheet.worksheet("Budget").get_all_values()
     df_budget = pd.DataFrame(ws_budget[1:], columns=ws_budget[0]) if ws_budget and len(ws_budget) > 1 else pd.DataFrame()
     
-    # Tratamento Lançamentos (Adaptado para as 13 colunas exatas da Query 2025)
+    # Tratamento Lançamentos
     if not df_lanc.empty:
         df_lanc["Realizado"] = df_lanc.get("Débito/crédito (MC)", pd.Series()).apply(normalizar_valor)
-        df_lanc["Data NF"] = pd.to_datetime(df_lanc.get("Mês"), errors='coerce')
+        coluna_mes_l = "Mês" if "Mês" in df_lanc.columns else "MÊS"
+        df_lanc["Data NF"] = pd.to_datetime(df_lanc.get(coluna_mes_l), errors='coerce')
         df_lanc["Competência"] = df_lanc["Data NF"].dt.strftime('%m/%Y')
         df_lanc["CONTA"] = df_lanc.get("Cta.contáb./cód.PN", pd.Series()).astype(str).str.strip()
         df_lanc["Fornecedor"] = df_lanc.get("Fornecedor", pd.Series()).astype(str).str.strip()
-        df_lanc["Centro de Custo"] = df_lanc.get("Centro de Custo", pd.Series()).astype(str).str.strip()
-        df_lanc["Observações"] = df_lanc.get("Observações", pd.Series()).astype(str).str.strip()
         
     # Tratamento Budget
     if not df_budget.empty:
         df_budget["Orçado"] = df_budget.get("BUDGET", pd.Series()).apply(normalizar_valor)
-        df_budget["Competência"] = pd.to_datetime(df_budget.get("MÊS"), dayfirst=True, errors='coerce').dt.strftime('%m/%Y')
+        # Permite flexibilidade de nome "Mês" ou "MÊS" na aba de budget
+        coluna_mes_b = "MÊS" if "MÊS" in df_budget.columns else "Mês"
+        df_budget["Competência"] = pd.to_datetime(df_budget.get(coluna_mes_b), dayfirst=True, errors='coerce').dt.strftime('%m/%Y')
         df_budget["CONTA"] = df_budget.get("CONTA", pd.Series()).astype(str).str.strip()
 
 except Exception as e:
@@ -116,11 +114,18 @@ tab1, tab2 = st.tabs(["👔 Visão Executiva (CFO)", "📥 Inserir Lançamento"]
 # MÓDULO A: DASHBOARD EXECUTIVO
 # ==========================================
 with tab1:
-    if not df_lanc.empty and not df_budget.empty:
+    if not df_lanc.empty or not df_budget.empty:
         st.markdown("### 🎛️ Parâmetros do Painel")
         col_f1, col_f2 = st.columns([1, 2])
         
-        meses_dash = sorted(df_budget["Competência"].dropna().unique().tolist())
+        # O PULO DO GATO: Unir os meses do Realizado e do Orçado
+        meses_lanc = df_lanc["Competência"].dropna().unique().tolist() if not df_lanc.empty else []
+        meses_bud = df_budget["Competência"].dropna().unique().tolist() if not df_budget.empty else []
+        
+        # Junta tudo, remove repetidos e valores em branco (NaT)
+        meses_dash = sorted(list(set(meses_lanc + meses_bud)))
+        meses_dash = [m for m in meses_dash if m != 'NaT' and str(m).strip() != 'nan' and str(m).strip() != '']
+        
         with col_f1:
             mes_alvo = st.selectbox("📅 Competência:", meses_dash, index=len(meses_dash)-1 if meses_dash else 0)
         with col_f2:
@@ -129,11 +134,11 @@ with tab1:
         st.markdown("---")
         
         # Cruzamento de Dados (Matching)
-        b_mes = df_budget[df_budget["Competência"] == mes_alvo].copy()
-        l_mes = df_lanc[df_lanc["Competência"] == mes_alvo].copy()
+        b_mes = df_budget[df_budget["Competência"] == mes_alvo].copy() if not df_budget.empty else pd.DataFrame(columns=["CONTA", "Orçado"])
+        l_mes = df_lanc[df_lanc["Competência"] == mes_alvo].copy() if not df_lanc.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
-        l_grp = l_mes.groupby("CONTA")["Realizado"].sum().reset_index()
-        df_bi = pd.merge(b_mes, l_grp, on="CONTA", how="left").fillna(0)
+        l_grp = l_mes.groupby("CONTA")["Realizado"].sum().reset_index() if not l_mes.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
+        df_bi = pd.merge(b_mes, l_grp, on="CONTA", how="outer").fillna(0) # 'outer' para mostrar contas que só tem gasto mas não tem budget
         df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
         
         tot_orc = df_bi["Orçado"].sum()
@@ -171,11 +176,11 @@ with tab1:
         col_g1, col_g2 = st.columns([2, 1])
         with col_g1:
             st.markdown("##### 📊 Realizado vs Orçado (Por Conta)")
-            df_chart = df_bi.set_index("CONTA")[["Orçado", "Realizado"]].sort_values("Orçado", ascending=False).head(10)
-            st.bar_chart(df_chart, color=["#1f77b4", "#ff7f0e"])
+            df_chart = df_bi.set_index("CONTA")[["Orçado", "Realizado"]].sort_values("Realizado", ascending=False).head(10)
+            if not df_chart.empty: st.bar_chart(df_chart, color=["#1f77b4", "#ff7f0e"])
         with col_g2:
             st.markdown("##### 💸 Maiores Custos")
-            st.bar_chart(df_bi.sort_values("Realizado", ascending=False).head(5).set_index("CONTA")["Realizado"], color="#d62728")
+            if not df_bi.empty: st.bar_chart(df_bi.sort_values("Realizado", ascending=False).head(5).set_index("CONTA")["Realizado"], color="#d62728")
 
         st.markdown("---")
 
@@ -224,11 +229,10 @@ with tab2:
                     cabecalhos = worksheet.row_values(1)
                     nova_linha = [""] * len(cabecalhos)
                     
-                    # Dicionário mapeado EXATAMENTE para as suas 13 colunas
                     dados_insert = {
                         "Mês": data_mes.strftime("%Y-%m-%d"),
                         "Cta.contáb./cód.PN": conta_sap,
-                        "Cta.cont./Nome PN": "", # Será preenchido vazio ou com PROCV no seu sheets
+                        "Cta.cont./Nome PN": "",
                         "Débito/crédito (MC)": str(valor_deb_cred).replace(".", ","),
                         "Observações": observacoes,
                         "Fornecedor": fornecedor,
@@ -236,7 +240,7 @@ with tab2:
                         "Diretoria": "",
                         "Natureza": "",
                         "Pacote": "",
-                        "FORNECEDOR": fornecedor, # Duplicado propositadamente de acordo com as suas colunas
+                        "FORNECEDOR": fornecedor,
                         "Cta.contáb./cód.PN 2": conta_sap,
                         "Conta Contabil": conta_sap
                     }
