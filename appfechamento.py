@@ -4,135 +4,247 @@ import numpy as np
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# --- CONFIGURAÇÕES DA PLATAFORMA ---
-st.set_page_config(page_title="Portal Financeiro BI", layout="wide", page_icon="🏢")
+# --- 1. CONFIGURAÇÕES DO PORTAL E SEGURANÇA ---
+st.set_page_config(page_title="Portal Financeiro Corporativo", layout="wide", page_icon="🏢")
 
-# --- SISTEMA DE ACESSO ---
 st.sidebar.title("🔒 Acesso Restrito")
-senha_digitada = st.sidebar.text_input("Senha Corporativa:", type="password")
+senha_digitada = st.sidebar.text_input("Palavra-passe Corporativa:", type="password")
 
-SENHA_CORRETA = st.secrets.get("senha_app", "admin123")
-URL_PLANILHA = st.secrets.get("url_planilha", "")
+# Credenciais e Variáveis de Ambiente (Secrets)
+SENHA_CORRETA = st.secrets.get("senha_app", "admin123") 
+URL_BANCO_DADOS = st.secrets.get("url_planilha", "")
 
 if senha_digitada != SENHA_CORRETA:
-    st.warning("Aguardando autenticação para carregar os dados...")
+    st.warning("⚠️ Insira a palavra-passe corporativa no menu lateral para aceder à plataforma.")
     st.stop()
 
-st.sidebar.success("Acesso Liberado")
+st.sidebar.success("✅ Acesso Liberado!")
 st.sidebar.markdown("---")
 
-# --- CONEXÃO GOOGLE SHEETS ---
-@st.cache_resource
-def get_client():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
-    return gspread.authorize(creds)
+# --- 2. CONEXÃO COM O GOOGLE SHEETS ---
+SCOPE = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
-# --- MOTOR DE LIMPEZA FINANCEIRA ---
-def limpar_financeiro(val):
+@st.cache_resource
+def get_google_client():
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
+        return gspread.authorize(creds)
+    except KeyError:
+        st.error("⚠️ Credenciais do Google não encontradas nos Secrets.")
+        st.stop()
+
+# --- 3. MOTOR DE NORMALIZAÇÃO DE DADOS ---
+def normalizar_valor(val):
+    """Lê qualquer formato numérico/moeda e converte para float do Python"""
     if pd.isna(val) or val == "": return 0.0
     if isinstance(val, (int, float)): return float(val)
+    
     s = str(val).upper().replace("R$", "").strip()
-    s = ''.join(c for c in s if c.isdigit() or c in '.,-')
+    s = ''.join(c for c in s if c.isdigit() or c in '.,-') # Mantém sinal negativo
     if not s or s == '-': return 0.0
-    if s.count('.') >= 1 and s.count(',') == 1: # Padrão BR 1.000,00
-        s = s.replace('.', '').replace(',', '.')
-    elif s.count(',') == 1 and s.count('.') == 0: # Padrão 1000,00
-        s = s.replace(',', '.')
+    
+    qtd_pontos = s.count('.')
+    qtd_virgulas = s.count(',')
+    
+    if qtd_pontos == 1 and qtd_virgulas == 1:
+        if s.rfind(',') > s.rfind('.'): s = s.replace('.', '').replace(',', '.')
+        else: s = s.replace(',', '') 
+    elif qtd_pontos > 1 and qtd_virgulas <= 1: s = s.replace('.', '').replace(',', '.') 
+    elif qtd_virgulas > 1 and qtd_pontos <= 1: s = s.replace(',', '') 
+    elif qtd_pontos == 1 and qtd_virgulas == 0:
+        if len(s.split('.')[-1]) == 3: s = s.replace('.', '') 
+    elif qtd_virgulas == 1 and qtd_pontos == 0:
+        if len(s.split(',')[-1]) == 3: s = s.replace(',', '') 
+        else: s = s.replace(',', '.') 
+        
     try: return float(s)
     except: return 0.0
 
-def formatar_br(n):
-    return f"R$ {n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def formatar_moeda(valor):
+    try:
+        if pd.isna(valor): return "R$ 0,00"
+        txt = f"{float(valor):,.2f}"
+        return f"R$ {txt.replace(',', 'X').replace('.', ',').replace('X', '.')}"
+    except: return "R$ 0,00"
 
-# --- CARREGAMENTO DE DADOS (ETL) ---
-try:
-    client = get_client()
-    sh = client.open_by_url(URL_PLANILHA)
-    
-    # Lançamentos
-    data_l = sh.worksheet("Lancamentos").get_all_values()
-    df_l = pd.DataFrame(data_l[1:], columns=data_l[0])
-    
-    # Budget
-    data_b = sh.worksheet("Budget").get_all_values()
-    df_b = pd.DataFrame(data_b[1:], columns=data_b[0])
-
-    # Normalização
-    df_l["Valor"] = df_l["Débito/crédito (MC)"].apply(limper_financeiro)
-    df_l["Competência"] = pd.to_datetime(df_l["Mês"], errors='coerce').dt.strftime('%m/%Y')
-    
-    df_b["Valor_B"] = df_b["BUDGET"].apply(limper_financeiro)
-    df_b["Competência"] = pd.to_datetime(df_b["MÊS"], dayfirst=True, errors='coerce').dt.strftime('%m/%Y')
-    
-except Exception as e:
-    st.error(f"Erro na conexão com os dados: {e}")
+# --- 4. EXTRAÇÃO DE DADOS (ETL) ---
+if not URL_BANCO_DADOS:
+    st.error("⚠️ Configure a 'url_planilha' no painel de Secrets.")
     st.stop()
 
-# --- INTERFACE ---
-tab1, tab2 = st.tabs(["👔 Dashboard CFO", "📥 Novo Lançamento"])
+try:
+    client = get_google_client()
+    sheet = client.open_by_url(URL_BANCO_DADOS)
+    
+    # Aba Query 2025 (Novo nome atualizado)
+    ws_lanc = sheet.worksheet("Query 2025").get_all_values()
+    df_lanc = pd.DataFrame(ws_lanc[1:], columns=ws_lanc[0]) if ws_lanc and len(ws_lanc) > 1 else pd.DataFrame()
+        
+    # Aba Budget
+    ws_budget = sheet.worksheet("Budget").get_all_values()
+    df_budget = pd.DataFrame(ws_budget[1:], columns=ws_budget[0]) if ws_budget and len(ws_budget) > 1 else pd.DataFrame()
+    
+    # Tratamento Lançamentos (Adaptado para as 13 colunas exatas da Query 2025)
+    if not df_lanc.empty:
+        df_lanc["Realizado"] = df_lanc.get("Débito/crédito (MC)", pd.Series()).apply(normalizar_valor)
+        df_lanc["Data NF"] = pd.to_datetime(df_lanc.get("Mês"), errors='coerce')
+        df_lanc["Competência"] = df_lanc["Data NF"].dt.strftime('%m/%Y')
+        df_lanc["CONTA"] = df_lanc.get("Cta.contáb./cód.PN", pd.Series()).astype(str).str.strip()
+        df_lanc["Fornecedor"] = df_lanc.get("Fornecedor", pd.Series()).astype(str).str.strip()
+        df_lanc["Centro de Custo"] = df_lanc.get("Centro de Custo", pd.Series()).astype(str).str.strip()
+        df_lanc["Observações"] = df_lanc.get("Observações", pd.Series()).astype(str).str.strip()
+        
+    # Tratamento Budget
+    if not df_budget.empty:
+        df_budget["Orçado"] = df_budget.get("BUDGET", pd.Series()).apply(normalizar_valor)
+        df_budget["Competência"] = pd.to_datetime(df_budget.get("MÊS"), dayfirst=True, errors='coerce').dt.strftime('%m/%Y')
+        df_budget["CONTA"] = df_budget.get("CONTA", pd.Series()).astype(str).str.strip()
 
+except Exception as e:
+    st.error(f"Falha ao conectar com a Planilha. Erro: {e}")
+    df_lanc, df_budget = pd.DataFrame(), pd.DataFrame()
+
+# --- 5. INTERFACE DO UTILIZADOR (TABS) ---
+tab1, tab2 = st.tabs(["👔 Visão Executiva (CFO)", "📥 Inserir Lançamento"])
+
+# ==========================================
+# MÓDULO A: DASHBOARD EXECUTIVO
+# ==========================================
 with tab1:
-    st.subheader("Performance Financeira")
-    
-    # Filtros
-    c1, c2 = st.columns([1, 2])
-    meses = sorted(df_b["Competência"].unique().tolist())
-    with c1:
-        mes_sel = st.selectbox("Selecione o Mês:", meses, index=len(meses)-1)
-    with c2:
-        mrr = st.number_input("Receita Mensal (MRR) R$:", min_value=0.0, format="%.2f")
+    if not df_lanc.empty and not df_budget.empty:
+        st.markdown("### 🎛️ Parâmetros do Painel")
+        col_f1, col_f2 = st.columns([1, 2])
+        
+        meses_dash = sorted(df_budget["Competência"].dropna().unique().tolist())
+        with col_f1:
+            mes_alvo = st.selectbox("📅 Competência:", meses_dash, index=len(meses_dash)-1 if meses_dash else 0)
+        with col_f2:
+            mrr_input = st.number_input("💰 Receita/MRR do Mês (R$)", min_value=0.0, format="%.2f", help="Insira a faturação para calcular margens.")
+        
+        st.markdown("---")
+        
+        # Cruzamento de Dados (Matching)
+        b_mes = df_budget[df_budget["Competência"] == mes_alvo].copy()
+        l_mes = df_lanc[df_lanc["Competência"] == mes_alvo].copy()
+        
+        l_grp = l_mes.groupby("CONTA")["Realizado"].sum().reset_index()
+        df_bi = pd.merge(b_mes, l_grp, on="CONTA", how="left").fillna(0)
+        df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
+        
+        tot_orc = df_bi["Orçado"].sum()
+        tot_real = df_bi["Realizado"].sum()
+        
+        # KPIs
+        pct_consumo_budget = (tot_real / tot_orc * 100) if tot_orc > 0 else 0
+        lucro_op = mrr_input - tot_real
+        margem_pct = (lucro_op / mrr_input * 100) if mrr_input > 0 else 0
 
-    # Cálculos
-    b_mes = df_b[df_b["Competência"] == mes_sel]
-    l_mes = df_l[df_l["Competência"] == mes_sel]
-    l_grp = l_mes.groupby("Cta.contáb./cód.PN")["Valor"].sum().reset_index()
-    
-    df_final = pd.merge(b_mes, l_grp, left_on="CONTA", right_on="Cta.contáb./cód.PN", how="left").fillna(0)
-    
-    tot_orc = df_final["Valor_B"].sum()
-    tot_real = df_final["Valor"].sum()
-    
-    # KPIs
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Receita Total", formatar_br(mrr))
-    k2.metric("Custos Totais", formatar_moeda_br(tot_real))
-    if mrr > 0:
-        margem = ((mrr - tot_real) / mrr) * 100
-        k3.metric("Margem Operacional", f"{margem:.1f}%", delta=f"{mrr-tot_real:,.2f}")
+        # Linha 1: Receita
+        st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Receita (MRR)", formatar_moeda(mrr_input))
+        k2.metric("Custos (Realizado)", formatar_moeda(tot_real))
+        if mrr_input > 0:
+            k3.metric("Lucro Operacional", formatar_moeda(lucro_op), f"{margem_pct:.1f}% de Margem", delta_color="normal")
+        else:
+            k3.metric("Lucro Operacional", "---")
 
-    st.divider()
-    
-    # Tabela Gerencial
-    st.markdown("### Detalhamento por Conta")
-    df_final["% Rec"] = (df_final["Valor"] / mrr * 100) if mrr > 0 else 0
-    df_final["Saldo"] = df_final["Valor_B"] - df_final["Valor"]
-    
-    st.dataframe(
-        df_final[["CONTA", "TIPO 1", "Valor_B", "Valor", "Saldo", "% Rec"]],
-        column_config={
-            "CONTA": "Conta SAP",
-            "Valor_B": st.column_config.NumberColumn("Budget", format="R$ %.2f"),
-            "Valor": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
-            "Saldo": st.column_config.NumberColumn("Saldo", format="R$ %.2f"),
-            "% Rec": st.column_config.ProgressColumn("% s/ Receita", format="%.2f%%", min_value=0, max_value=20)
-        },
-        use_container_width=True, hide_index=True
-    )
+        st.markdown("<br>", unsafe_allow_html=True)
 
+        # Linha 2: Budget
+        st.markdown("##### 🎯 Consumo de Budget")
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Orçamento Total", formatar_moeda(tot_orc))
+        b2.metric("Saldo Disponível", formatar_moeda(tot_orc - tot_real), "Estouro" if (tot_orc - tot_real) < 0 else "OK", delta_color="normal")
+        with b3:
+            st.markdown(f"**Progresso:** `{pct_consumo_budget:.1f}%`")
+            st.progress(min(pct_consumo_budget / 100, 1.0))
+
+        st.markdown("---")
+
+        # Gráficos
+        col_g1, col_g2 = st.columns([2, 1])
+        with col_g1:
+            st.markdown("##### 📊 Realizado vs Orçado (Por Conta)")
+            df_chart = df_bi.set_index("CONTA")[["Orçado", "Realizado"]].sort_values("Orçado", ascending=False).head(10)
+            st.bar_chart(df_chart, color=["#1f77b4", "#ff7f0e"])
+        with col_g2:
+            st.markdown("##### 💸 Maiores Custos")
+            st.bar_chart(df_bi.sort_values("Realizado", ascending=False).head(5).set_index("CONTA")["Realizado"], color="#d62728")
+
+        st.markdown("---")
+
+        # Tabela Gerencial
+        st.markdown("##### 📋 Matriz de Custos")
+        df_bi["% Consumo da Receita"] = np.where(mrr_input > 0, (df_bi["Realizado"] / mrr_input) * 100, 0)
+        
+        st.dataframe(
+            df_bi[["CONTA", "Orçado", "Realizado", "Saldo", "% Consumo da Receita"]],
+            column_config={
+                "Orçado": st.column_config.NumberColumn("Budget", format="R$ %.2f"),
+                "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
+                "Saldo": st.column_config.NumberColumn("Saldo", format="R$ %.2f"),
+                "% Consumo da Receita": st.column_config.ProgressColumn("Peso na Receita", format="%.2f%%", min_value=0, max_value=100)
+            },
+            hide_index=True, use_container_width=True
+        )
+
+# ==========================================
+# MÓDULO B: INGESTÃO MANUAL
+# ==========================================
 with tab2:
-    st.subheader("Inserir Dado Manual")
-    with st.form("f1", clear_on_submit=True):
+    st.markdown("### Lançamento Unitário no ERP (Query 2025)")
+    st.caption("Ao preencher, o sistema preencherá automaticamente as colunas da folha.")
+    
+    with st.form("form_novo_lancamento", clear_on_submit=True):
         c1, c2 = st.columns(2)
-        m = c1.date_input("Mês da Competência")
-        cta = c1.text_input("Conta SAP")
-        forn = c2.text_input("Fornecedor")
-        val = c2.number_input("Valor R$", format="%.2f")
-        obs = st.text_area("Observações")
-        if st.form_submit_button("Gravar na Planilha"):
-            # Lógica de gravação simples
-            try:
-                sh.worksheet("Lancamentos").append_row([m.strftime("%Y-%m-%d"), cta, "", "", val, obs, forn])
-                st.success("Gravado!")
-            except:
-                st.error("Erro ao gravar")
+        with c1:
+            data_mes = st.date_input("Mês da Competência *")
+            conta_sap = st.text_input("Cta.contáb./cód.PN (Ex: 4.1.02.01.0002) *")
+            fornecedor = st.text_input("Fornecedor *")
+        with c2:
+            centro_custo = st.text_input("Centro de Custo")
+            valor_deb_cred = st.number_input("Débito/crédito (MC) (R$) *", format="%.2f")
+            observacoes = st.text_input("Observações")
+
+        submit = st.form_submit_button("🚀 Inserir Linha na Folha", use_container_width=True)
+
+    if submit:
+        if not conta_sap or not fornecedor:
+            st.error("❌ Preencha os campos obrigatórios (*).")
+        else:
+            with st.spinner("A guardar no Banco de Dados..."):
+                try:
+                    worksheet = sheet.worksheet("Query 2025")
+                    cabecalhos = worksheet.row_values(1)
+                    nova_linha = [""] * len(cabecalhos)
+                    
+                    # Dicionário mapeado EXATAMENTE para as suas 13 colunas
+                    dados_insert = {
+                        "Mês": data_mes.strftime("%Y-%m-%d"),
+                        "Cta.contáb./cód.PN": conta_sap,
+                        "Cta.cont./Nome PN": "", # Será preenchido vazio ou com PROCV no seu sheets
+                        "Débito/crédito (MC)": str(valor_deb_cred).replace(".", ","),
+                        "Observações": observacoes,
+                        "Fornecedor": fornecedor,
+                        "Centro de Custo": centro_custo,
+                        "Diretoria": "",
+                        "Natureza": "",
+                        "Pacote": "",
+                        "FORNECEDOR": fornecedor, # Duplicado propositadamente de acordo com as suas colunas
+                        "Cta.contáb./cód.PN 2": conta_sap,
+                        "Conta Contabil": conta_sap
+                    }
+                    
+                    for col_nome, valor in dados_insert.items():
+                        if col_nome in cabecalhos: nova_linha[cabecalhos.index(col_nome)] = valor
+                            
+                    worksheet.append_row(nova_linha)
+                    st.success("✅ Lançamento inserido com sucesso na base de dados!")
+                except Exception as e:
+                    st.error(f"Erro de conexão: {e}")
