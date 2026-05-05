@@ -10,7 +10,6 @@ st.set_page_config(page_title="Portal Financeiro Corporativo", layout="wide", pa
 st.sidebar.title("🔒 Acesso Restrito")
 senha_digitada = st.sidebar.text_input("Palavra-passe Corporativa:", type="password")
 
-# Credenciais e Variáveis de Ambiente (Secrets)
 SENHA_CORRETA = st.secrets.get("senha_app", "admin123") 
 URL_BANCO_DADOS = st.secrets.get("url_planilha", "")
 
@@ -88,15 +87,15 @@ try:
     ws_budget = sheet.worksheet("Budget").get_all_values()
     df_budget = pd.DataFrame(ws_budget[1:], columns=ws_budget[0]) if ws_budget and len(ws_budget) > 1 else pd.DataFrame()
     
-    # Tratamento Lançamentos
+    # Tratamento Lançamentos (Query 2025)
     if not df_lanc.empty:
         colunas_upper_l = [str(c).strip().upper() for c in df_lanc.columns]
         
-        # Encontra coluna de Valor
+        # Valor do Realizado
         col_val_l = df_lanc.columns[colunas_upper_l.index("DÉBITO/CRÉDITO (MC)")] if "DÉBITO/CRÉDITO (MC)" in colunas_upper_l else df_lanc.columns[0]
         df_lanc["Realizado"] = df_lanc[col_val_l].apply(normalizar_valor)
         
-        # Encontra coluna de Mês
+        # Competência
         col_mes_l = next((c for c, c_up in zip(df_lanc.columns, colunas_upper_l) if c_up in ['MÊS', 'MES', 'DATA']), None)
         if col_mes_l:
             df_lanc["Data_Temp"] = pd.to_datetime(df_lanc[col_mes_l], errors='coerce')
@@ -104,21 +103,25 @@ try:
         else:
             df_lanc["Competência"] = "Sem Data"
             
-        # Encontra coluna de Conta (Código)
+        # Conta SAP
         col_conta_l = next((c for c, c_up in zip(df_lanc.columns, colunas_upper_l) if c_up in ['CTA.CONTÁB./CÓD.PN', 'CONTA', 'CONTA SAP']), None)
         df_lanc["CONTA"] = df_lanc[col_conta_l].astype(str).str.strip() if col_conta_l else "Sem Conta"
 
-        # Encontra coluna de Nome da Conta (NOVIDADE)
-        col_nome_l = next((c for c, c_up in zip(df_lanc.columns, colunas_upper_l) if c_up in ['CTA.CONT./NOME PN', 'NOME DA CONTA', 'DESCRIÇÃO']), None)
-        df_lanc["Nome da Conta"] = df_lanc[col_nome_l].astype(str).str.strip() if col_nome_l else df_lanc["CONTA"]
+        # FORNECEDOR (Coluna L da aba Query 2025 - Índice 11)
+        if len(df_lanc.columns) >= 12:
+            df_lanc["Fornecedor"] = df_lanc.iloc[:, 11].astype(str).str.strip() # Coluna L exata
+        else:
+            df_lanc["Fornecedor"] = "Sem Fornecedor"
 
-    # Tratamento Budget (Busca Inteligente)
+    # Tratamento Budget
     if not df_budget.empty:
         colunas_upper_b = [str(c).strip().upper() for c in df_budget.columns]
         
+        # Valor Orçado
         col_valor_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['BUDGET', 'ORÇADO', 'ORCAMENTO', 'VALOR']), None)
         df_budget["Orçado"] = df_budget[col_valor_b].apply(normalizar_valor) if col_valor_b else 0.0
         
+        # Competência
         col_mes_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['MÊS', 'MES', 'DATA', 'COMPETÊNCIA', 'PERÍODO']), None)
         if col_mes_b:
             df_budget["Data_Temp"] = pd.to_datetime(df_budget[col_mes_b], errors='coerce')
@@ -126,8 +129,15 @@ try:
         else:
             df_budget["Competência"] = "Sem Data"
             
+        # Conta SAP
         col_conta_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['CONTA', 'CONTA SAP', 'CÓDIGO', 'CTA.CONTÁB./CÓD.PN']), None)
         df_budget["CONTA"] = df_budget[col_conta_b].astype(str).str.strip() if col_conta_b else "Sem Conta"
+
+        # NOME DA CONTA (Coluna C da aba Budget - Índice 2)
+        if len(df_budget.columns) >= 3:
+            df_budget["Nome da Conta"] = df_budget.iloc[:, 2].astype(str).str.strip() # Coluna C exata
+        else:
+            df_budget["Nome da Conta"] = df_budget["CONTA"]
 
 except Exception as e:
     st.error(f"Falha ao conectar com a Planilha. Erro: {e}")
@@ -157,23 +167,23 @@ with tab1:
         
         st.markdown("---")
         
-        # Cruzamento de Dados (Matching)
-        b_mes = df_budget[df_budget["Competência"] == mes_alvo].copy() if not df_budget.empty else pd.DataFrame(columns=["CONTA", "Orçado"])
-        l_mes = df_lanc[df_lanc["Competência"] == mes_alvo].copy() if not df_lanc.empty else pd.DataFrame(columns=["CONTA", "Realizado", "Nome da Conta"])
+        # Filtragem por Mês
+        b_mes = df_budget[df_budget["Competência"] == mes_alvo].copy() if not df_budget.empty else pd.DataFrame(columns=["CONTA", "Orçado", "Nome da Conta"])
+        l_mes = df_lanc[df_lanc["Competência"] == mes_alvo].copy() if not df_lanc.empty else pd.DataFrame(columns=["CONTA", "Realizado", "Fornecedor"])
         
-        b_grp = b_mes.groupby("CONTA")["Orçado"].sum().reset_index() if not b_mes.empty else pd.DataFrame(columns=["CONTA", "Orçado"])
+        # Agrupamento (Garante que leva o Nome da Conta do Budget)
+        b_grp = b_mes.groupby(["CONTA", "Nome da Conta"])["Orçado"].sum().reset_index() if not b_mes.empty else pd.DataFrame(columns=["CONTA", "Nome da Conta", "Orçado"])
         l_grp = l_mes.groupby("CONTA")["Realizado"].sum().reset_index() if not l_mes.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
+        # Matching (Une Orçamento com o Realizado)
         df_bi = pd.merge(b_grp, l_grp, on="CONTA", how="outer").fillna(0)
         
-        # O TRADUTOR DE NOMES (De Código SAP para Nome da Conta)
-        if not df_lanc.empty:
-            dict_nomes = df_lanc.drop_duplicates("CONTA").set_index("CONTA")["Nome da Conta"].to_dict()
-            df_bi["Nome da Conta"] = df_bi["CONTA"].map(dict_nomes).fillna(df_bi["CONTA"])
-            df_bi["Nome da Conta"] = np.where(df_bi["Nome da Conta"] == "", df_bi["CONTA"], df_bi["Nome da Conta"])
-        else:
-            df_bi["Nome da Conta"] = df_bi["CONTA"]
-
+        # Limpa Contas que não têm orçamento NEM realizado (Filtra o lixo)
+        df_bi = df_bi[(df_bi["Orçado"] != 0) | (df_bi["Realizado"] != 0)]
+        
+        # Se apareceu um lançamento surpresa que não tinha no budget, ele copia o código SAP para o Nome da Conta não ficar vazio
+        df_bi["Nome da Conta"] = np.where(df_bi["Nome da Conta"] == 0, df_bi["CONTA"], df_bi["Nome da Conta"])
+        
         df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
         
         tot_orc = df_bi["Orçado"].sum()
@@ -188,7 +198,7 @@ with tab1:
         st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
         k1, k2, k3 = st.columns(3)
         k1.metric("Receita (MRR)", formatar_moeda(mrr_input))
-        k2.metric("Custos (Realizado)", formatar_moeda(tot_real))
+        k2.metric("Custos Totais", formatar_moeda(tot_real))
         if mrr_input > 0:
             k3.metric("Lucro Operacional", formatar_moeda(lucro_op), f"{margem_pct:.1f}% de Margem", delta_color="normal")
         else:
@@ -202,31 +212,43 @@ with tab1:
         b1.metric("Orçamento Total", formatar_moeda(tot_orc))
         b2.metric("Saldo Disponível", formatar_moeda(tot_orc - tot_real), "Estouro" if (tot_orc - tot_real) < 0 else "OK", delta_color="normal")
         with b3:
-            st.markdown(f"**Progresso:** `{pct_consumo_budget:.1f}%`")
+            st.markdown(f"**Progresso Global:** `{pct_consumo_budget:.1f}%`")
             st.progress(min(pct_consumo_budget / 100, 1.0))
 
         st.markdown("---")
 
-        # Gráficos COM OS NOMES DAS CONTAS
-        col_g1, col_g2 = st.columns([2, 1])
+        # Gráficos (Agora são 3 Gráficos lado a lado)
+        col_g1, col_g2, col_g3 = st.columns(3)
+        
         with col_g1:
-            st.markdown("##### 📊 Realizado vs Orçado (Por Conta)")
+            st.markdown("##### 📊 Orçado vs Realizado")
             df_chart = df_bi.set_index("Nome da Conta")[["Orçado", "Realizado"]].sort_values("Realizado", ascending=False).head(10)
             if not df_chart.empty: st.bar_chart(df_chart, color=["#1f77b4", "#ff7f0e"])
+            
         with col_g2:
-            st.markdown("##### 💸 Maiores Custos")
+            st.markdown("##### 💸 Maiores Custos (Contas)")
             if not df_bi.empty: st.bar_chart(df_bi.sort_values("Realizado", ascending=False).head(5).set_index("Nome da Conta")["Realizado"], color="#d62728")
+
+        with col_g3:
+            st.markdown("##### 🚚 Top Custos por Fornecedor")
+            if not l_mes.empty and "Fornecedor" in l_mes.columns:
+                df_forn = l_mes.groupby("Fornecedor")["Realizado"].sum().reset_index()
+                df_forn = df_forn[df_forn["Realizado"] > 0].sort_values("Realizado", ascending=False).head(8)
+                if not df_forn.empty:
+                    st.bar_chart(df_forn.set_index("Fornecedor")["Realizado"], color="#2ca02c")
+                else:
+                    st.info("Sem dados de fornecedor.")
 
         st.markdown("---")
 
-        # Tabela Gerencial COM OS NOMES DAS CONTAS
+        # Tabela Gerencial (Com nomes limpos da aba Budget)
         st.markdown("##### 📋 Matriz de Custos")
         df_bi["% Consumo da Receita"] = np.where(mrr_input > 0, (df_bi["Realizado"] / mrr_input) * 100, 0)
         
         st.dataframe(
-            df_bi[["Nome da Conta", "Orçado", "Realizado", "Saldo", "% Consumo da Receita"]],
+            df_bi[["Nome da Conta", "Orçado", "Realizado", "Saldo", "% Consumo da Receita"]].sort_values("Realizado", ascending=False),
             column_config={
-                "Nome da Conta": st.column_config.TextColumn("Conta / Descrição"),
+                "Nome da Conta": st.column_config.TextColumn("Conta / Descrição (Budget)"),
                 "Orçado": st.column_config.NumberColumn("Budget", format="R$ %.2f"),
                 "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
                 "Saldo": st.column_config.NumberColumn("Saldo", format="R$ %.2f"),
@@ -247,7 +269,6 @@ with tab2:
         with c1:
             data_mes = st.date_input("Mês da Competência *")
             conta_sap = st.text_input("Cta.contáb./cód.PN (Ex: 4.1.02.01.0002) *")
-            nome_conta = st.text_input("Nome da Conta (Cta.cont./Nome PN)")
             fornecedor = st.text_input("Fornecedor *")
         with c2:
             centro_custo = st.text_input("Centro de Custo")
@@ -269,7 +290,7 @@ with tab2:
                     dados_insert = {
                         "Mês": data_mes.strftime("%Y-%m-%d"),
                         "Cta.contáb./cód.PN": conta_sap,
-                        "Cta.cont./Nome PN": nome_conta,
+                        "Cta.cont./Nome PN": "",
                         "Débito/crédito (MC)": str(valor_deb_cred).replace(".", ","),
                         "Observações": observacoes,
                         "Fornecedor": fornecedor,
