@@ -79,23 +79,19 @@ try:
     client = get_google_client()
     sheet = client.open_by_url(URL_BANCO_DADOS)
     
-    # Aba Query 2025
     ws_lanc = sheet.worksheet("Query 2025").get_all_values()
     df_lanc = pd.DataFrame(ws_lanc[1:], columns=ws_lanc[0]) if ws_lanc and len(ws_lanc) > 1 else pd.DataFrame()
         
-    # Aba Budget
     ws_budget = sheet.worksheet("Budget").get_all_values()
     df_budget = pd.DataFrame(ws_budget[1:], columns=ws_budget[0]) if ws_budget and len(ws_budget) > 1 else pd.DataFrame()
     
-    # Tratamento Lançamentos (Query 2025)
+    # Tratamento Lançamentos
     if not df_lanc.empty:
         colunas_upper_l = [str(c).strip().upper() for c in df_lanc.columns]
         
-        # Valor do Realizado
         col_val_l = df_lanc.columns[colunas_upper_l.index("DÉBITO/CRÉDITO (MC)")] if "DÉBITO/CRÉDITO (MC)" in colunas_upper_l else df_lanc.columns[0]
         df_lanc["Realizado"] = df_lanc[col_val_l].apply(normalizar_valor)
         
-        # Competência
         col_mes_l = next((c for c, c_up in zip(df_lanc.columns, colunas_upper_l) if c_up in ['MÊS', 'MES', 'DATA']), None)
         if col_mes_l:
             df_lanc["Data_Temp"] = pd.to_datetime(df_lanc[col_mes_l], errors='coerce')
@@ -103,13 +99,11 @@ try:
         else:
             df_lanc["Competência"] = "Sem Data"
             
-        # Conta SAP
         col_conta_l = next((c for c, c_up in zip(df_lanc.columns, colunas_upper_l) if c_up in ['CTA.CONTÁB./CÓD.PN', 'CONTA', 'CONTA SAP']), None)
         df_lanc["CONTA"] = df_lanc[col_conta_l].astype(str).str.strip() if col_conta_l else "Sem Conta"
 
-        # FORNECEDOR (Coluna L da aba Query 2025 - Índice 11)
         if len(df_lanc.columns) >= 12:
-            df_lanc["Fornecedor"] = df_lanc.iloc[:, 11].astype(str).str.strip() # Coluna L exata
+            df_lanc["Fornecedor"] = df_lanc.iloc[:, 11].astype(str).str.strip()
         else:
             df_lanc["Fornecedor"] = "Sem Fornecedor"
 
@@ -117,11 +111,9 @@ try:
     if not df_budget.empty:
         colunas_upper_b = [str(c).strip().upper() for c in df_budget.columns]
         
-        # Valor Orçado
         col_valor_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['BUDGET', 'ORÇADO', 'ORCAMENTO', 'VALOR']), None)
         df_budget["Orçado"] = df_budget[col_valor_b].apply(normalizar_valor) if col_valor_b else 0.0
         
-        # Competência
         col_mes_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['MÊS', 'MES', 'DATA', 'COMPETÊNCIA', 'PERÍODO']), None)
         if col_mes_b:
             df_budget["Data_Temp"] = pd.to_datetime(df_budget[col_mes_b], errors='coerce')
@@ -129,13 +121,11 @@ try:
         else:
             df_budget["Competência"] = "Sem Data"
             
-        # Conta SAP
         col_conta_b = next((c for c, c_up in zip(df_budget.columns, colunas_upper_b) if c_up in ['CONTA', 'CONTA SAP', 'CÓDIGO', 'CTA.CONTÁB./CÓD.PN']), None)
         df_budget["CONTA"] = df_budget[col_conta_b].astype(str).str.strip() if col_conta_b else "Sem Conta"
 
-        # NOME DA CONTA (Coluna C da aba Budget - Índice 2)
         if len(df_budget.columns) >= 3:
-            df_budget["Nome da Conta"] = df_budget.iloc[:, 2].astype(str).str.strip() # Coluna C exata
+            df_budget["Nome da Conta"] = df_budget.iloc[:, 2].astype(str).str.strip()
         else:
             df_budget["Nome da Conta"] = df_budget["CONTA"]
 
@@ -167,34 +157,25 @@ with tab1:
         
         st.markdown("---")
         
-        # Filtragem por Mês
         b_mes = df_budget[df_budget["Competência"] == mes_alvo].copy() if not df_budget.empty else pd.DataFrame(columns=["CONTA", "Orçado", "Nome da Conta"])
         l_mes = df_lanc[df_lanc["Competência"] == mes_alvo].copy() if not df_lanc.empty else pd.DataFrame(columns=["CONTA", "Realizado", "Fornecedor"])
         
-        # Agrupamento (Garante que leva o Nome da Conta do Budget)
         b_grp = b_mes.groupby(["CONTA", "Nome da Conta"])["Orçado"].sum().reset_index() if not b_mes.empty else pd.DataFrame(columns=["CONTA", "Nome da Conta", "Orçado"])
         l_grp = l_mes.groupby("CONTA")["Realizado"].sum().reset_index() if not l_mes.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
-        # Matching (Une Orçamento com o Realizado)
         df_bi = pd.merge(b_grp, l_grp, on="CONTA", how="outer").fillna(0)
-        
-        # Limpa Contas que não têm orçamento NEM realizado (Filtra o lixo)
         df_bi = df_bi[(df_bi["Orçado"] != 0) | (df_bi["Realizado"] != 0)]
-        
-        # Se apareceu um lançamento surpresa que não tinha no budget, ele copia o código SAP para o Nome da Conta não ficar vazio
         df_bi["Nome da Conta"] = np.where(df_bi["Nome da Conta"] == 0, df_bi["CONTA"], df_bi["Nome da Conta"])
-        
         df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
         
         tot_orc = df_bi["Orçado"].sum()
         tot_real = df_bi["Realizado"].sum()
         
-        # KPIs
         pct_consumo_budget = (tot_real / tot_orc * 100) if tot_orc > 0 else 0
         lucro_op = mrr_input - tot_real
         margem_pct = (lucro_op / mrr_input * 100) if mrr_input > 0 else 0
 
-        # Linha 1: Receita
+        # KPIs Superiores
         st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
         k1, k2, k3 = st.columns(3)
         k1.metric("Receita (MRR)", formatar_moeda(mrr_input))
@@ -205,9 +186,7 @@ with tab1:
             k3.metric("Lucro Operacional", "---")
 
         st.markdown("<br>", unsafe_allow_html=True)
-
-        # Linha 2: Budget
-        st.markdown("##### 🎯 Consumo de Budget")
+        st.markdown("##### 🎯 Consumo de Budget Global")
         b1, b2, b3 = st.columns(3)
         b1.metric("Orçamento Total", formatar_moeda(tot_orc))
         b2.metric("Saldo Disponível", formatar_moeda(tot_orc - tot_real), "Estouro" if (tot_orc - tot_real) < 0 else "OK", delta_color="normal")
@@ -217,18 +196,15 @@ with tab1:
 
         st.markdown("---")
 
-        # Gráficos (Agora são 3 Gráficos lado a lado)
+        # Gráficos
         col_g1, col_g2, col_g3 = st.columns(3)
-        
         with col_g1:
             st.markdown("##### 📊 Orçado vs Realizado")
             df_chart = df_bi.set_index("Nome da Conta")[["Orçado", "Realizado"]].sort_values("Realizado", ascending=False).head(10)
             if not df_chart.empty: st.bar_chart(df_chart, color=["#1f77b4", "#ff7f0e"])
-            
         with col_g2:
             st.markdown("##### 💸 Maiores Custos (Contas)")
             if not df_bi.empty: st.bar_chart(df_bi.sort_values("Realizado", ascending=False).head(5).set_index("Nome da Conta")["Realizado"], color="#d62728")
-
         with col_g3:
             st.markdown("##### 🚚 Top Custos por Fornecedor")
             if not l_mes.empty and "Fornecedor" in l_mes.columns:
@@ -241,18 +217,44 @@ with tab1:
 
         st.markdown("---")
 
-        # Tabela Gerencial (Com nomes limpos da aba Budget)
+        # --- NOVOS CÁLCULOS PARA A TABELA (BARRA E STATUS) ---
         st.markdown("##### 📋 Matriz de Custos")
+        
+        # 1. Porcentagem de consumo do budget individual
+        df_bi["% Uso do Budget"] = np.where(df_bi["Orçado"] > 0, (df_bi["Realizado"] / df_bi["Orçado"]) * 100, 0)
+        # Se não tiver orçamento mas tiver custo, crava em 100% para mostrar a barra cheia
+        df_bi["% Uso do Budget"] = np.where((df_bi["Orçado"] == 0) & (df_bi["Realizado"] > 0), 100.0, df_bi["% Uso do Budget"])
+        
+        # 2. Porcentagem da Receita
         df_bi["% Consumo da Receita"] = np.where(mrr_input > 0, (df_bi["Realizado"] / mrr_input) * 100, 0)
         
+        # 3. Semáforo de Status
+        df_bi["Status"] = np.where(df_bi["Realizado"] > df_bi["Orçado"], "🔴 Estourou", np.where(df_bi["Realizado"] >= df_bi["Orçado"] * 0.85, "🟡 Alerta", "🟢 OK"))
+        # Exceção: Se não tem gasto nem orçamento, fica neutro
+        df_bi["Status"] = np.where((df_bi["Orçado"] == 0) & (df_bi["Realizado"] == 0), "⚪ Sem Movimento", df_bi["Status"])
+        
+        # Tabela com as novas colunas
         st.dataframe(
-            df_bi[["Nome da Conta", "Orçado", "Realizado", "Saldo", "% Consumo da Receita"]].sort_values("Realizado", ascending=False),
+            df_bi[["Status", "Nome da Conta", "Orçado", "Realizado", "Saldo", "% Uso do Budget", "% Consumo da Receita"]].sort_values("Realizado", ascending=False),
             column_config={
+                "Status": st.column_config.TextColumn("Alerta"),
                 "Nome da Conta": st.column_config.TextColumn("Conta / Descrição (Budget)"),
                 "Orçado": st.column_config.NumberColumn("Budget", format="R$ %.2f"),
                 "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
                 "Saldo": st.column_config.NumberColumn("Saldo", format="R$ %.2f"),
-                "% Consumo da Receita": st.column_config.ProgressColumn("Peso na Receita", format="%.2f%%", min_value=0, max_value=100)
+                "% Uso do Budget": st.column_config.ProgressColumn(
+                    "🔥 Consumo do Budget", 
+                    help="Quanto do orçamento planeado já foi gasto (vai de 0 a 100%)", 
+                    format="%.1f%%", 
+                    min_value=0, 
+                    max_value=100
+                ),
+                "% Consumo da Receita": st.column_config.ProgressColumn(
+                    "Peso na Receita", 
+                    format="%.2f%%", 
+                    min_value=0, 
+                    max_value=100
+                )
             },
             hide_index=True, use_container_width=True
         )
