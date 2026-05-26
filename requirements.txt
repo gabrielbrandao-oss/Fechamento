@@ -4,3 +4,4 @@ numpy
 gspread
 oauth2client
 bcrypt
+plotly
