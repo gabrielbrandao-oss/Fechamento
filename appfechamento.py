@@ -6,6 +6,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import bcrypt
 import re
+from datetime import datetime
 import html
 import plotly.express as px
 import plotly.graph_objects as go
@@ -73,9 +74,9 @@ def formatar_moeda(valor: float) -> str:
     if pd.isna(valor): return "R$ 0,00"
     return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
-# --- 4. EXTRAÇÃO ETL COM RESOLUÇÃO DE PARSING DE DATA ---
+# --- 4. EXTRAÇÃO ETL (CACHE V5) ---
 @st.cache_data(ttl=600)
-def extrair_dados_nuvem_v4():
+def extrair_dados_nuvem_v5():
     client = get_google_client()
     sheet = client.open_by_url(URL_BANCO_DADOS)
     try:
@@ -119,7 +120,7 @@ def extrair_dados_nuvem_v4():
 
     return df_lanc, df_budget
 
-df_lanc, df_budget = extrair_dados_nuvem_v4()
+df_lanc, df_budget = extrair_dados_nuvem_v5()
 
 # --- 5. INTERFACE DO USUÁRIO ---
 tab1, tab2 = st.tabs(["👔 Visão Executiva (CFO)", "📥 Inserir Lançamento"])
@@ -150,7 +151,7 @@ with tab1:
                 st.info(f"Visão Consolidada ({ano_alvo})")
                 
         with col_f4:
-            mrr_input = st.number_input(f"💰 Receita/MRR do Período ({'Mês' if tipo_visao == 'Mensal' else 'Ano'})", min_value=0.0, format="%.2f")
+            mrr_input = st.number_input(f"💰 Receita Manual (Opcional)", min_value=0.0, format="%.2f")
 
         st.markdown("---")
         
@@ -177,6 +178,66 @@ with tab1:
                 b_prev, _ = filtrar_periodo(ano_prev, "Todos", "Anual Consolidada")
                 rotulo_comparativo = f"vs Budget Ant. ({ano_prev})"
 
+        # =========================================================================
+        # ISOLAMENTO DE KPIS: Leitura EXCLUSIVA da aba Budget para os Cards Superiores
+        # =========================================================================
+        
+        # 1. Orçamento Total (Garantido da aba Budget)
+        tot_orc_kpi = b_atual["Orçado"].sum()
+        
+        # 2. Custos Realizados (Busca coluna "Realizado" no Budget; se não achar, cai pro Query2025)
+        col_real_budget = next((c for c in b_atual.columns if "REALIZADO" in c or "EXECUTADO" in c), None)
+        if col_real_budget:
+            b_atual[col_real_budget] = b_atual[col_real_budget].apply(normalizar_valor)
+            tot_real_kpi = b_atual[col_real_budget].sum()
+            # Se a coluna existir mas estiver zerada, aciona fallback
+            if tot_real_kpi == 0: tot_real_kpi = l_atual["Realizado"].sum()
+        else:
+            tot_real_kpi = l_atual["Realizado"].sum()
+            
+        # 3. Receita MRR (Busca "Receita" no Budget; se não achar, usa o input manual)
+        col_rec_budget = next((c for c in b_atual.columns if "RECEITA" in c or "MRR" in c or "FATURAMENTO" in c), None)
+        if col_rec_budget:
+            b_atual[col_rec_budget] = b_atual[col_rec_budget].apply(normalizar_valor)
+            mrr_val = b_atual[col_rec_budget].sum()
+            if mrr_val == 0: mrr_val = mrr_input
+        else:
+            mrr_val = mrr_input
+
+        # Cálculos Derivados dos KPIs
+        pct_consumo_budget = (tot_real_kpi / tot_orc_kpi * 100) if tot_orc_kpi > 0 else 0.0
+        lucro_op = mrr_val - tot_real_kpi
+        margem_pct = (lucro_op / mrr_val * 100) if mrr_val > 0 else 0.0
+
+        if tot_orc_kpi > 0:
+            var_custos = ((tot_real_kpi - tot_orc_kpi) / tot_orc_kpi) * 100
+            delta_real_vs_orc = f"{var_custos:+.1f}% vs Orçamento"
+        else:
+            delta_real_vs_orc = None
+
+        tot_orc_prev = b_prev["Orçado"].sum() if not b_prev.empty else 0.0
+        delta_orc_pct = f"{((tot_orc_kpi - tot_orc_prev) / tot_orc_prev * 100):+.1f}% {rotulo_comparativo}" if tot_orc_prev > 0 else None
+        delta_lucro = f"{margem_pct:.1f}% de Margem" if mrr_val > 0 else None
+
+        st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Receita Declarada", formatar_moeda(mrr_val))
+        k2.metric("Custos Totais Realizados", formatar_moeda(tot_real_kpi), delta=delta_real_vs_orc, delta_color="inverse")
+        k3.metric("Lucro Operacional Estimado", formatar_moeda(lucro_op), delta=delta_lucro, delta_color="normal")
+
+        st.markdown("##### 🎯 Consumo de Budget Global")
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Orçamento Total (Aba Budget)", formatar_moeda(tot_orc_kpi), delta=delta_orc_pct, delta_color="off")
+        b2.metric("Saldo Disponível em Caixa", formatar_moeda(tot_orc_kpi - tot_real_kpi), "Estouro" if (tot_orc_kpi - tot_real_kpi) < 0 else "OK", delta_color="normal")
+        with b3:
+            st.markdown(f"**Burn Rate:** `{pct_consumo_budget:.1f}%`")
+            st.progress(min(pct_consumo_budget / 100, 1.0))
+
+        st.markdown("---")
+        
+        # =========================================================================
+        # CONSOLIDAÇÃO PARA GRÁFICOS (Segue fluxo normal Mesclado)
+        # =========================================================================
         b_grp = b_atual.groupby(["CONTA", "Nome da Conta"])["Orçado"].sum().reset_index() if not b_atual.empty else pd.DataFrame(columns=["CONTA", "Nome da Conta", "Orçado"])
         l_grp = l_atual.groupby("CONTA")["Realizado"].sum().reset_index() if not l_atual.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
@@ -184,39 +245,6 @@ with tab1:
         df_bi = df_bi[(df_bi["Orçado"] != 0) | (df_bi["Realizado"] != 0)]
         df_bi["Nome da Conta"] = np.where(df_bi["Nome da Conta"] == 0, df_bi["CONTA"], df_bi["Nome da Conta"])
         df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
-        
-        tot_orc = df_bi["Orçado"].sum()
-        tot_real = df_bi["Realizado"].sum()
-        pct_consumo_budget = (tot_real / tot_orc * 100) if tot_orc > 0 else 0.0
-        lucro_op = mrr_input - tot_real
-        margem_pct = (lucro_op / mrr_input * 100) if mrr_input > 0 else 0.0
-
-        # --- CORREÇÃO DE DIRECIONAMENTO DE BASE DOS CARDS (BUDGET ABSOLUTO) ---
-        if tot_orc > 0:
-            var_custos = ((tot_real - tot_orc) / tot_orc) * 100
-            delta_real_vs_orc = f"{var_custos:+.1f}% vs Orçamento"
-        else:
-            delta_real_vs_orc = None
-
-        tot_orc_prev = b_prev["Orçado"].sum() if not b_prev.empty else 0.0
-        delta_orc_pct = f"{((tot_orc - tot_orc_prev) / tot_orc_prev * 100):+.1f}% {rotulo_comparativo}" if tot_orc_prev > 0 else None
-        delta_lucro = f"{margem_pct:.1f}% de Margem" if mrr_input > 0 else None
-
-        st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Receita Declarada (MRR)", formatar_moeda(mrr_input))
-        k2.metric("Custos Totais Realizados", formatar_moeda(tot_real), delta=delta_real_vs_orc, delta_color="inverse")
-        k3.metric("Lucro Operacional Estimado", formatar_moeda(lucro_op), delta=delta_lucro, delta_color="normal")
-
-        st.markdown("##### 🎯 Consumo de Budget Global")
-        b1, b2, b3 = st.columns(3)
-        b1.metric("Orçamento Total (Budget)", formatar_moeda(tot_orc), delta=delta_orc_pct, delta_color="off")
-        b2.metric("Saldo Disponível em Caixa", formatar_moeda(tot_orc - tot_real), "Estouro" if (tot_orc - tot_real) < 0 else "OK", delta_color="normal")
-        with b3:
-            st.markdown(f"**Burn Rate:** `{pct_consumo_budget:.1f}%`")
-            st.progress(min(pct_consumo_budget / 100, 1.0))
-
-        st.markdown("---")
         
         linha1_col1, line1_col2 = st.columns([3, 2])
         with linha1_col1:
@@ -227,7 +255,7 @@ with tab1:
         with line1_col2:
             fig_waterfall = go.Figure(go.Waterfall(
                 name="P&L", orientation="v", measure=["relative", "relative", "total"], x=["Receita", "Custos", "Resultado"], textposition="outside",
-                text=[f"R$ {mrr_input:,.0f}", f"R$ {-tot_real:,.0f}", f"R$ {lucro_op:,.0f}"], y=[mrr_input, -tot_real, lucro_op],
+                text=[f"R$ {mrr_val:,.0f}", f"R$ {-tot_real_kpi:,.0f}", f"R$ {lucro_op:,.0f}"], y=[mrr_val, -tot_real_kpi, lucro_op],
                 connector={"line": {"color": "rgb(63, 63, 63)"}}, decreasing={"marker": {"color": "#d62728"}}, increasing={"marker": {"color": "#2ca02c"}}, totals={"marker": {"color": "#1f77b4"}}
             ))
             fig_waterfall.update_layout(title="Formação do Resultado (Cash Burn)", margin=dict(t=40, b=0, l=0, r=0))
@@ -251,7 +279,7 @@ with tab1:
         st.markdown("---")
         st.markdown("##### 📋 Matriz de Custos")
         df_bi["% Uso do Budget"] = np.where(df_bi["Orçado"] > 0, (df_bi["Realizado"] / df_bi["Orçado"]) * 100, np.where(df_bi["Realizado"] > 0, 100.0, 0))
-        df_bi["% Consumo da Receita"] = np.where(mrr_input > 0, (df_bi["Realizado"] / mrr_input) * 100, 0)
+        df_bi["% Consumo da Receita"] = np.where(mrr_val > 0, (df_bi["Realizado"] / mrr_val) * 100, 0)
         df_bi["Status"] = np.where(df_bi["Realizado"] > df_bi["Orçado"], "🔴 Estourou", np.where(df_bi["Realizado"] >= df_bi["Orçado"] * 0.85, "🟡 Alerta", "🟢 OK"))
         df_bi["Status"] = np.where((df_bi["Orçado"] == 0) & (df_bi["Realizado"] == 0), "⚪ Sem Movimento", df_bi["Status"])
         
@@ -302,6 +330,6 @@ with tab2:
                     nova_linha = [dados_insert.get(col, "") for col in cabecalhos]
                     worksheet.append_row(nova_linha)
                     st.success("✅ Lançamento auditado e inserido com sucesso.")
-                    extrair_dados_nuvem_v4.clear() 
+                    extrair_dados_nuvem_v5.clear() 
                 except Exception as e:
                     st.error(f"🚨 Falha na transação DML: {e}")
