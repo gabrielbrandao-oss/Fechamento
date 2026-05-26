@@ -6,7 +6,6 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import bcrypt
 import re
-from datetime import datetime
 import html
 import plotly.express as px
 import plotly.graph_objects as go
@@ -74,9 +73,9 @@ def formatar_moeda(valor: float) -> str:
     if pd.isna(valor): return "R$ 0,00"
     return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
-# --- 4. EXTRAÇÃO ETL (NOME ALTERADO PARA FORÇAR QUEBRA DE CACHE ANTIGO) ---
+# --- 4. EXTRAÇÃO ETL COM RESOLUÇÃO DE PARSING DE DATA ---
 @st.cache_data(ttl=600)
-def extrair_dados_nuvem_v3():
+def extrair_dados_nuvem_v4():
     client = get_google_client()
     sheet = client.open_by_url(URL_BANCO_DADOS)
     try:
@@ -93,8 +92,12 @@ def extrair_dados_nuvem_v3():
         col_val_l = "DÉBITO/CRÉDITO (MC)" if "DÉBITO/CRÉDITO (MC)" in df_lanc.columns else df_lanc.columns[0]
         df_lanc["Realizado"] = df_lanc[col_val_l].apply(normalizar_valor)
         col_mes_l = next((c for c in df_lanc.columns if c in ['MÊS', 'MES', 'DATA']), None)
-        df_lanc["Competência"] = pd.to_datetime(df_lanc[col_mes_l], errors='coerce').dt.strftime('%m/%Y').fillna("Sem Data") if col_mes_l else "Sem Data"
-        df_lanc["Ano"] = df_lanc["Competência"].apply(lambda x: str(x).split('/')[-1] if '/' in str(x) else 'Sem Data')
+        if col_mes_l:
+            data_temp = pd.to_datetime(df_lanc[col_mes_l], errors='coerce')
+            df_lanc["Competência"] = data_temp.dt.strftime('%m/%Y').fillna(df_lanc[col_mes_l].astype(str).str.strip())
+        else:
+            df_lanc["Competência"] = "Sem Data"
+        df_lanc["Ano"] = df_lanc["Competência"].apply(lambda x: str(x).split('/')[-1] if '/' in str(x) else str(x))
         col_conta_l = next((c for c in df_lanc.columns if c in ['CTA.CONTÁB./CÓD.PN', 'CONTA', 'CONTA SAP']), None)
         df_lanc["CONTA"] = df_lanc[col_conta_l].astype(str).str.strip() if col_conta_l else "Sem Conta"
         df_lanc["Fornecedor"] = df_lanc.iloc[:, 11].astype(str).str.strip() if len(df_lanc.columns) >= 12 else "Sem Fornecedor"
@@ -104,15 +107,19 @@ def extrair_dados_nuvem_v3():
         col_valor_b = next((c for c in df_budget.columns if c in ['BUDGET', 'ORÇADO', 'ORCAMENTO', 'VALOR']), None)
         df_budget["Orçado"] = df_budget[col_valor_b].apply(normalizar_valor) if col_valor_b else 0.0
         col_mes_b = next((c for c in df_budget.columns if c in ['MÊS', 'MES', 'DATA', 'COMPETÊNCIA', 'PERÍODO']), None)
-        df_budget["Competência"] = pd.to_datetime(df_budget[col_mes_b], errors='coerce').dt.strftime('%m/%Y').fillna("Sem Data") if col_mes_b else "Sem Data"
-        df_budget["Ano"] = df_budget["Competência"].apply(lambda x: str(x).split('/')[-1] if '/' in str(x) else 'Sem Data')
+        if col_mes_b:
+            data_temp = pd.to_datetime(df_budget[col_mes_b], errors='coerce')
+            df_budget["Competência"] = data_temp.dt.strftime('%m/%Y').fillna(df_budget[col_mes_b].astype(str).str.strip())
+        else:
+            df_budget["Competência"] = "Sem Data"
+        df_budget["Ano"] = df_budget["Competência"].apply(lambda x: str(x).split('/')[-1] if '/' in str(x) else str(x))
         col_conta_b = next((c for c in df_budget.columns if c in ['CONTA', 'CONTA SAP', 'CÓDIGO', 'CTA.CONTÁB./CÓD.PN']), None)
         df_budget["CONTA"] = df_budget[col_conta_b].astype(str).str.strip() if col_conta_b else "Sem Conta"
         df_budget["Nome da Conta"] = df_budget.iloc[:, 2].astype(str).str.strip() if len(df_budget.columns) >= 3 else df_budget["CONTA"]
 
     return df_lanc, df_budget
 
-df_lanc, df_budget = extrair_dados_nuvem_v3()
+df_lanc, df_budget = extrair_dados_nuvem_v4()
 
 # --- 5. INTERFACE DO USUÁRIO ---
 tab1, tab2 = st.tabs(["👔 Visão Executiva (CFO)", "📥 Inserir Lançamento"])
@@ -121,7 +128,6 @@ with tab1:
     if not df_lanc.empty or not df_budget.empty:
         st.markdown("### 🎛️ Motor de Filtros Analíticos")
         
-        # 1. ANCORAGEM NO BUDGET: Anos extraídos exclusivamente da aba Budget
         anos_disponiveis = sorted(list(set(df_budget["Ano"].dropna().astype(str).tolist())), reverse=True)
         anos_disponiveis = [a for a in anos_disponiveis if a.isdigit()]
         if not anos_disponiveis: anos_disponiveis = [str(datetime.now().year)]
@@ -136,7 +142,6 @@ with tab1:
             
         with col_f3:
             if tipo_visao == "Mensal":
-                # 2. ANCORAGEM NO BUDGET: Meses extraídos exclusivamente da aba Budget para o ano selecionado
                 meses_disp = sorted(list(set(df_budget[df_budget["Ano"] == ano_alvo]["Competência"].dropna().tolist())))
                 meses_disp = [m for m in meses_disp if '/' in str(m)]
                 mes_alvo = st.selectbox("📆 Mês Alvo:", meses_disp, index=len(meses_disp)-1 if meses_disp else 0)
@@ -149,7 +154,6 @@ with tab1:
 
         st.markdown("---")
         
-        # Filtros de Período Atual
         def filtrar_periodo(ano, mes, visao):
             b = df_budget[df_budget["Competência"] == mes] if visao == "Mensal" else df_budget[df_budget["Ano"] == ano]
             l = df_lanc[df_lanc["Competência"] == mes] if visao == "Mensal" else df_lanc[df_lanc["Ano"] == ano]
@@ -157,7 +161,6 @@ with tab1:
 
         b_atual, l_atual = filtrar_periodo(ano_alvo, mes_alvo, tipo_visao)
         
-        # Filtros de Período Anterior (Para Deltas do Budget)
         b_prev = pd.DataFrame()
         rotulo_comparativo = ""
         
@@ -174,7 +177,6 @@ with tab1:
                 b_prev, _ = filtrar_periodo(ano_prev, "Todos", "Anual Consolidada")
                 rotulo_comparativo = f"vs Budget Ant. ({ano_prev})"
 
-        # Consolidação
         b_grp = b_atual.groupby(["CONTA", "Nome da Conta"])["Orçado"].sum().reset_index() if not b_atual.empty else pd.DataFrame(columns=["CONTA", "Nome da Conta", "Orçado"])
         l_grp = l_atual.groupby("CONTA")["Realizado"].sum().reset_index() if not l_atual.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
@@ -189,26 +191,17 @@ with tab1:
         lucro_op = mrr_input - tot_real
         margem_pct = (lucro_op / mrr_input * 100) if mrr_input > 0 else 0.0
 
-        # --- REGRAS ESTritas DE DELTAS (Comparando sempre contra o Budget) ---
-        
-        # Delta 1: Custos Realizados contra o Budget do mês ALVO.
+        # --- CORREÇÃO DE DIRECIONAMENTO DE BASE DOS CARDS (BUDGET ABSOLUTO) ---
         if tot_orc > 0:
             var_custos = ((tot_real - tot_orc) / tot_orc) * 100
-            delta_real_vs_orc = f"{var_custos:+.1f}% vs Orçamento Atual"
+            delta_real_vs_orc = f"{var_custos:+.1f}% vs Orçamento"
         else:
-            delta_real_vs_orc = "Sem Orçamento Base"
+            delta_real_vs_orc = None
 
-        # Delta 2: Crescimento/Queda da régua do Orçamento contra o Budget do mês ANTERIOR.
         tot_orc_prev = b_prev["Orçado"].sum() if not b_prev.empty else 0.0
-        if tot_orc_prev > 0:
-            delta_orc_pct = f"{((tot_orc - tot_orc_prev) / tot_orc_prev * 100):+.1f}% {rotulo_comparativo}"
-        else:
-            delta_orc_pct = None
-
-        # Delta 3: Ocultar seta de lucro caso não haja preenchimento de MRR.
+        delta_orc_pct = f"{((tot_orc - tot_orc_prev) / tot_orc_prev * 100):+.1f}% {rotulo_comparativo}" if tot_orc_prev > 0 else None
         delta_lucro = f"{margem_pct:.1f}% de Margem" if mrr_input > 0 else None
 
-        # --- RENDERIZAÇÃO DOS KPIS ---
         st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
         k1, k2, k3 = st.columns(3)
         k1.metric("Receita Declarada (MRR)", formatar_moeda(mrr_input))
@@ -218,55 +211,40 @@ with tab1:
         st.markdown("##### 🎯 Consumo de Budget Global")
         b1, b2, b3 = st.columns(3)
         b1.metric("Orçamento Total (Budget)", formatar_moeda(tot_orc), delta=delta_orc_pct, delta_color="off")
-        b2.metric("Saldo Disponível em Caixa", formatar_moeda(tot_orc - tot_real), "Estouro Identificado" if (tot_orc - tot_real) < 0 else "Dentro do Previsto", delta_color="normal")
+        b2.metric("Saldo Disponível em Caixa", formatar_moeda(tot_orc - tot_real), "Estouro" if (tot_orc - tot_real) < 0 else "OK", delta_color="normal")
         with b3:
-            st.markdown(f"**Velocidade de Queima (Burn Rate):** `{pct_consumo_budget:.1f}%`")
+            st.markdown(f"**Burn Rate:** `{pct_consumo_budget:.1f}%`")
             st.progress(min(pct_consumo_budget / 100, 1.0))
 
         st.markdown("---")
         
-        linha1_col1, linha1_col2 = st.columns([3, 2])
-
+        linha1_col1, line1_col2 = st.columns([3, 2])
         with linha1_col1:
             df_chart1 = df_bi.set_index("Nome da Conta")[["Orçado", "Realizado"]].sort_values("Realizado", ascending=False).head(10).reset_index()
-            fig_vs = px.bar(
-                df_chart1, x="Nome da Conta", y=["Orçado", "Realizado"], barmode="group",
-                title="Orçamento vs Execução (Top 10 Contas)", color_discrete_map={"Orçado": "#1f77b4", "Realizado": "#ff7f0e"}
-            )
+            fig_vs = px.bar(df_chart1, x="Nome da Conta", y=["Orçado", "Realizado"], barmode="group", title="Orçamento vs Execução (Top 10 Contas)", color_discrete_map={"Orçado": "#1f77b4", "Realizado": "#ff7f0e"})
             fig_vs.update_layout(xaxis_title="", yaxis_title="Valor (R$)", legend_title_text="", margin=dict(t=40, b=0, l=0, r=0))
             st.plotly_chart(fig_vs, use_container_width=True)
-
-        with linha1_col2:
+        with line1_col2:
             fig_waterfall = go.Figure(go.Waterfall(
-                name="P&L", orientation="v", measure=["relative", "relative", "total"],
-                x=["Receita", "Custos", "Resultado"], textposition="outside",
-                text=[f"R$ {mrr_input:,.0f}", f"R$ {-tot_real:,.0f}", f"R$ {lucro_op:,.0f}"],
-                y=[mrr_input, -tot_real, lucro_op], connector={"line": {"color": "rgb(63, 63, 63)"}},
-                decreasing={"marker": {"color": "#d62728"}}, increasing={"marker": {"color": "#2ca02c"}}, totals={"marker": {"color": "#1f77b4"}}
+                name="P&L", orientation="v", measure=["relative", "relative", "total"], x=["Receita", "Custos", "Resultado"], textposition="outside",
+                text=[f"R$ {mrr_input:,.0f}", f"R$ {-tot_real:,.0f}", f"R$ {lucro_op:,.0f}"], y=[mrr_input, -tot_real, lucro_op],
+                connector={"line": {"color": "rgb(63, 63, 63)"}}, decreasing={"marker": {"color": "#d62728"}}, increasing={"marker": {"color": "#2ca02c"}}, totals={"marker": {"color": "#1f77b4"}}
             ))
             fig_waterfall.update_layout(title="Formação do Resultado (Cash Burn)", margin=dict(t=40, b=0, l=0, r=0))
             st.plotly_chart(fig_waterfall, use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         linha2_col1, linha2_col2 = st.columns(2)
-
         with linha2_col1:
             df_chart2 = df_bi.sort_values("Realizado", ascending=True).tail(7)
-            fig_custos = px.bar(
-                df_chart2, x="Realizado", y="Nome da Conta", orientation="h",
-                title="Curva ABC: Maiores Ofensores de Caixa", color_discrete_sequence=["#d62728"], text_auto='.2s'
-            )
+            fig_custos = px.bar(df_chart2, x="Realizado", y="Nome da Conta", orientation="h", title="Curva ABC: Maiores Ofensores", color_discrete_sequence=["#d62728"], text_auto='.2s')
             fig_custos.update_layout(xaxis_title="", yaxis_title="", margin=dict(t=40, b=0, l=0, r=0))
             st.plotly_chart(fig_custos, use_container_width=True)
-
         with linha2_col2:
             if not l_atual.empty and "Fornecedor" in l_atual.columns:
                 df_forn = l_atual.groupby("Fornecedor")["Realizado"].sum().reset_index()
                 df_chart3 = df_forn[df_forn["Realizado"] > 0].sort_values("Realizado", ascending=True).tail(7)
-                fig_forn = px.bar(
-                    df_chart3, x="Realizado", y="Fornecedor", orientation="h",
-                    title="Concentração por Fornecedor (Top 7)", color_discrete_sequence=["#2ca02c"], text_auto='.2s'
-                )
+                fig_forn = px.bar(df_chart3, x="Realizado", y="Fornecedor", orientation="h", title="Concentração por Fornecedor (Top 7)", color_discrete_sequence=["#2ca02c"], text_auto='.2s')
                 fig_forn.update_layout(xaxis_title="", yaxis_title="", margin=dict(t=40, b=0, l=0, r=0))
                 st.plotly_chart(fig_forn, use_container_width=True)
 
@@ -280,10 +258,8 @@ with tab1:
         st.dataframe(
             df_bi[["Status", "Nome da Conta", "Orçado", "Realizado", "Saldo", "% Uso do Budget", "% Consumo da Receita"]].sort_values("Realizado", ascending=False),
             column_config={
-                "Status": st.column_config.TextColumn("Alerta"),
-                "Nome da Conta": st.column_config.TextColumn("Conta (Budget)"),
-                "Orçado": st.column_config.NumberColumn("Budget", format="R$ %.2f"),
-                "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
+                "Status": st.column_config.TextColumn("Alerta"), "Nome da Conta": st.column_config.TextColumn("Conta (Budget)"),
+                "Orçado": st.column_config.NumberColumn("Budget", format="R$ %.2f"), "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
                 "Saldo": st.column_config.NumberColumn("Saldo", format="R$ %.2f"),
                 "% Uso do Budget": st.column_config.ProgressColumn("🔥 Consumo", format="%.1f%%", min_value=0, max_value=100),
                 "% Consumo da Receita": st.column_config.ProgressColumn("Peso Receita", format="%.2f%%", min_value=0, max_value=100)
@@ -308,7 +284,6 @@ with tab2:
     if submit:
         conta_sap_san = sanitizar_input(conta_sap)
         fornecedor_san = sanitizar_input(fornecedor)
-        
         if not conta_sap_san or not fornecedor_san:
             st.error("🚨 Entradas inválidas ou campos obrigatórios ausentes.")
         else:
@@ -318,22 +293,15 @@ with tab2:
                     sheet = client.open_by_url(URL_BANCO_DADOS)
                     worksheet = sheet.worksheet("Query 2025")
                     cabecalhos = worksheet.row_values(1)
-                    
                     dados_insert = {
-                        "Mês": data_mes.strftime("%Y-%m-%d"),
-                        "Cta.contáb./cód.PN": conta_sap_san,
-                        "Débito/crédito (MC)": str(valor_deb_cred).replace(".", ","),
-                        "Observações": sanitizar_input(observacoes),
-                        "Fornecedor": fornecedor_san,
-                        "Centro de Custo": sanitizar_input(centro_custo),
-                        "FORNECEDOR": fornecedor_san,
-                        "Cta.contáb./cód.PN 2": conta_sap_san,
-                        "Conta Contabil": conta_sap_san
+                        "Mês": data_mes.strftime("%Y-%m-%d"), "Cta.contáb./cód.PN": conta_sap_san,
+                        "Débito/crédito (MC)": str(valor_deb_cred).replace(".", ","), "Observações": sanitizar_input(observacoes),
+                        "Fornecedor": fornecedor_san, "Centro de Custo": sanitizar_input(centro_custo), "FORNECEDOR": fornecedor_san,
+                        "Cta.contáb./cód.PN 2": conta_sap_san, "Conta Contabil": conta_sap_san
                     }
-                    
                     nova_linha = [dados_insert.get(col, "") for col in cabecalhos]
                     worksheet.append_row(nova_linha)
                     st.success("✅ Lançamento auditado e inserido com sucesso.")
-                    extrair_dados_nuvem_v3.clear() 
+                    extrair_dados_nuvem_v4.clear() 
                 except Exception as e:
                     st.error(f"🚨 Falha na transação DML: {e}")
