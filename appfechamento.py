@@ -1,4 +1,4 @@
-# app.py
+# appfechamento.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -28,12 +28,11 @@ def sanitizar_input(texto: str) -> str:
 st.sidebar.title("🔒 Acesso Restrito")
 senha_digitada = st.sidebar.text_input("Palavra-passe Corporativa:", type="password")
 
-# Fim de senhas em hardcode. O Secret deve conter o HASH bcrypt, não a senha em texto plano.
 HASH_SENHA = st.secrets.get("senha_app_hash", "")
 URL_BANCO_DADOS = st.secrets.get("url_planilha", "")
 
 if not HASH_SENHA or not URL_BANCO_DADOS:
-    st.error("🚨 Falha de Configuração Crítica: Secrets ausentes. Verifique 'senha_app_hash' e 'url_planilha'.")
+    st.error("🚨 Falha de Configuração Crítica: Secrets ausentes. Verifique 'senha_app_hash' e 'url_planilha' no painel do Streamlit Cloud.")
     st.stop()
 
 if not verificar_senha(senha_digitada, HASH_SENHA):
@@ -111,28 +110,22 @@ def carregar_dados_etl():
         st.error(f"🚨 Erro de I/O no Google Sheets: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
-    # Vetorização e Tratamento Defensivo Lançamentos
     if not df_lanc.empty:
         df_lanc.columns = [str(c).strip().upper() for c in df_lanc.columns]
         col_val_l = "DÉBITO/CRÉDITO (MC)" if "DÉBITO/CRÉDITO (MC)" in df_lanc.columns else df_lanc.columns[0]
         df_lanc["Realizado"] = df_lanc[col_val_l].apply(normalizar_valor)
-        
         col_mes_l = next((c for c in df_lanc.columns if c in ['MÊS', 'MES', 'DATA']), None)
         df_lanc["Competência"] = pd.to_datetime(df_lanc[col_mes_l], errors='coerce').dt.strftime('%m/%Y').fillna("Sem Data") if col_mes_l else "Sem Data"
-        
         col_conta_l = next((c for c in df_lanc.columns if c in ['CTA.CONTÁB./CÓD.PN', 'CONTA', 'CONTA SAP']), None)
         df_lanc["CONTA"] = df_lanc[col_conta_l].astype(str).str.strip() if col_conta_l else "Sem Conta"
         df_lanc["Fornecedor"] = df_lanc.iloc[:, 11].astype(str).str.strip() if len(df_lanc.columns) >= 12 else "Sem Fornecedor"
 
-    # Vetorização e Tratamento Defensivo Budget
     if not df_budget.empty:
         df_budget.columns = [str(c).strip().upper() for c in df_budget.columns]
         col_valor_b = next((c for c in df_budget.columns if c in ['BUDGET', 'ORÇADO', 'ORCAMENTO', 'VALOR']), None)
         df_budget["Orçado"] = df_budget[col_valor_b].apply(normalizar_valor) if col_valor_b else 0.0
-        
         col_mes_b = next((c for c in df_budget.columns if c in ['MÊS', 'MES', 'DATA', 'COMPETÊNCIA', 'PERÍODO']), None)
         df_budget["Competência"] = pd.to_datetime(df_budget[col_mes_b], errors='coerce').dt.strftime('%m/%Y').fillna("Sem Data") if col_mes_b else "Sem Data"
-        
         col_conta_b = next((c for c in df_budget.columns if c in ['CONTA', 'CONTA SAP', 'CÓDIGO', 'CTA.CONTÁB./CÓD.PN']), None)
         df_budget["CONTA"] = df_budget[col_conta_b].astype(str).str.strip() if col_conta_b else "Sem Conta"
         df_budget["Nome da Conta"] = df_budget.iloc[:, 2].astype(str).str.strip() if len(df_budget.columns) >= 3 else df_budget["CONTA"]
@@ -241,7 +234,6 @@ with tab2:
         submit = st.form_submit_button("🚀 Inserir Linha", use_container_width=True)
 
     if submit:
-        # Sanitização estrita de entradas
         conta_sap_san = sanitizar_input(conta_sap)
         fornecedor_san = sanitizar_input(fornecedor)
         
@@ -270,6 +262,6 @@ with tab2:
                     nova_linha = [dados_insert.get(col, "") for col in cabecalhos]
                     worksheet.append_row(nova_linha)
                     st.success("✅ Lançamento auditado e inserido com sucesso.")
-                    carregar_dados_etl.clear() # Invalida cache após escrita
+                    carregar_dados_etl.clear() 
                 except Exception as e:
                     st.error(f"🚨 Falha na transação DML: {e}")
