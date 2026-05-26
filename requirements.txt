@@ -1,5 +1,7 @@
+# requirements.txt
 streamlit
 pandas
 numpy
 gspread
 oauth2client
+bcrypt
