@@ -6,8 +6,9 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import bcrypt
 import re
-from datetime import datetime
 import html
+import plotly.express as px
+import plotly.graph_objects as go
 
 # --- 1. CONFIGURAÇÕES E SEGURANÇA (APPSEC) ---
 st.set_page_config(page_title="Portal Financeiro Corporativo", layout="wide", page_icon="🏢")
@@ -32,7 +33,7 @@ HASH_SENHA = st.secrets.get("senha_app_hash", "")
 URL_BANCO_DADOS = st.secrets.get("url_planilha", "")
 
 if not HASH_SENHA or not URL_BANCO_DADOS:
-    st.error("🚨 Falha de Configuração Crítica: Secrets ausentes. Verifique 'senha_app_hash' e 'url_planilha' no painel do Streamlit Cloud.")
+    st.error("🚨 Falha de Configuração Crítica: Secrets ausentes. Verifique as chaves no painel do Streamlit Cloud.")
     st.stop()
 
 if not verificar_senha(senha_digitada, HASH_SENHA):
@@ -59,7 +60,7 @@ def get_google_client():
         st.error("🚨 Erro Crítico na injeção de credenciais GCP.")
         st.stop()
 
-# --- 3. MOTOR DE NORMALIZAÇÃO DE DADOS OTIMIZADO ---
+# --- 3. MOTOR DE NORMALIZAÇÃO DE DADOS ---
 def normalizar_valor(val) -> float:
     if pd.isna(val) or val == "": 
         return 0.0
@@ -186,19 +187,73 @@ with tab1:
             st.progress(min(pct_consumo_budget / 100, 1.0))
 
         st.markdown("---")
-        col_g1, col_g2, col_g3 = st.columns(3)
-        with col_g1:
-            st.markdown("##### 📊 Orçado vs Realizado")
-            st.bar_chart(df_bi.set_index("Nome da Conta")[["Orçado", "Realizado"]].sort_values("Realizado", ascending=False).head(10), color=["#1f77b4", "#ff7f0e"])
-        with col_g2:
-            st.markdown("##### 💸 Maiores Custos")
-            st.bar_chart(df_bi.sort_values("Realizado", ascending=False).head(5).set_index("Nome da Conta")["Realizado"], color="#d62728")
-        with col_g3:
-            st.markdown("##### 🚚 Top Fornecedores")
+        
+        # --- NOVO MOTOR DE RENDERIZAÇÃO DE GRÁFICOS (PLOTLY) ---
+        linha1_col1, linha1_col2 = st.columns([3, 2])
+
+        with linha1_col1:
+            df_chart1 = df_bi.set_index("Nome da Conta")[["Orçado", "Realizado"]].sort_values("Realizado", ascending=False).head(10).reset_index()
+            fig_vs = px.bar(
+                df_chart1,
+                x="Nome da Conta",
+                y=["Orçado", "Realizado"],
+                barmode="group",
+                title="Orçamento vs Execução (Top 10 Contas)",
+                color_discrete_map={"Orçado": "#1f77b4", "Realizado": "#ff7f0e"}
+            )
+            fig_vs.update_layout(xaxis_title="", yaxis_title="Valor (R$)", legend_title_text="", margin=dict(t=40, b=0, l=0, r=0))
+            st.plotly_chart(fig_vs, use_container_width=True)
+
+        with linha1_col2:
+            fig_waterfall = go.Figure(go.Waterfall(
+                name="P&L", orientation="v",
+                measure=["relative", "relative", "total"],
+                x=["Receita (MRR)", "Custos Totais", "Lucro Operacional"],
+                textposition="outside",
+                text=[f"R$ {mrr_input:,.0f}", f"R$ {-tot_real:,.0f}", f"R$ {lucro_op:,.0f}"],
+                y=[mrr_input, -tot_real, lucro_op],
+                connector={"line": {"color": "rgb(63, 63, 63)"}},
+                decreasing={"marker": {"color": "#d62728"}},
+                increasing={"marker": {"color": "#2ca02c"}},
+                totals={"marker": {"color": "#1f77b4"}}
+            ))
+            fig_waterfall.update_layout(title="Formação do Resultado (Cash Burn)", margin=dict(t=40, b=0, l=0, r=0))
+            st.plotly_chart(fig_waterfall, use_container_width=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        linha2_col1, linha2_col2 = st.columns(2)
+
+        with linha2_col1:
+            df_chart2 = df_bi.sort_values("Realizado", ascending=True).tail(7)
+            fig_custos = px.bar(
+                df_chart2,
+                x="Realizado",
+                y="Nome da Conta",
+                orientation="h",
+                title="Curva ABC: Maiores Ofensores de Caixa",
+                color_discrete_sequence=["#d62728"],
+                text_auto='.2s'
+            )
+            fig_custos.update_layout(xaxis_title="", yaxis_title="", margin=dict(t=40, b=0, l=0, r=0))
+            st.plotly_chart(fig_custos, use_container_width=True)
+
+        with linha2_col2:
             if not l_mes.empty and "Fornecedor" in l_mes.columns:
                 df_forn = l_mes.groupby("Fornecedor")["Realizado"].sum().reset_index()
-                st.bar_chart(df_forn[df_forn["Realizado"] > 0].sort_values("Realizado", ascending=False).head(8).set_index("Fornecedor")["Realizado"], color="#2ca02c")
+                df_chart3 = df_forn[df_forn["Realizado"] > 0].sort_values("Realizado", ascending=True).tail(7)
+                fig_forn = px.bar(
+                    df_chart3,
+                    x="Realizado",
+                    y="Fornecedor",
+                    orientation="h",
+                    title="Concentração por Fornecedor (Top 7)",
+                    color_discrete_sequence=["#2ca02c"],
+                    text_auto='.2s'
+                )
+                fig_forn.update_layout(xaxis_title="", yaxis_title="", margin=dict(t=40, b=0, l=0, r=0))
+                st.plotly_chart(fig_forn, use_container_width=True)
 
+        st.markdown("---")
         st.markdown("##### 📋 Matriz de Custos")
         df_bi["% Uso do Budget"] = np.where(df_bi["Orçado"] > 0, (df_bi["Realizado"] / df_bi["Orçado"]) * 100, np.where(df_bi["Realizado"] > 0, 100.0, 0))
         df_bi["% Consumo da Receita"] = np.where(mrr_input > 0, (df_bi["Realizado"] / mrr_input) * 100, 0)
