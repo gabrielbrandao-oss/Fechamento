@@ -1,3 +1,6 @@
-git add requirements.txt
-git commit -m "build: mapeia dependencias do projeto para runtime do streamlit cloud"
-git push origin main
+streamlit
+pandas
+numpy
+gspread
+oauth2client
+bcrypt
