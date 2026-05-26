@@ -74,9 +74,9 @@ def formatar_moeda(valor: float) -> str:
     if pd.isna(valor): return "R$ 0,00"
     return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
-# --- 4. EXTRAÇÃO ETL (CACHE V5) ---
+# --- 4. EXTRAÇÃO ETL (CACHE V6 - ISOLAMENTO DRILL-DOWN) ---
 @st.cache_data(ttl=600)
-def extrair_dados_nuvem_v5():
+def extrair_dados_nuvem_v6():
     client = get_google_client()
     sheet = client.open_by_url(URL_BANCO_DADOS)
     try:
@@ -120,7 +120,7 @@ def extrair_dados_nuvem_v5():
 
     return df_lanc, df_budget
 
-df_lanc, df_budget = extrair_dados_nuvem_v5()
+df_lanc, df_budget = extrair_dados_nuvem_v6()
 
 # --- 5. INTERFACE DO USUÁRIO ---
 tab1, tab2 = st.tabs(["👔 Visão Executiva (CFO)", "📥 Inserir Lançamento"])
@@ -161,7 +161,6 @@ with tab1:
             return b.copy(), l.copy()
 
         b_atual, l_atual = filtrar_periodo(ano_alvo, mes_alvo, tipo_visao)
-        
         b_prev = pd.DataFrame()
         rotulo_comparativo = ""
         
@@ -178,24 +177,16 @@ with tab1:
                 b_prev, _ = filtrar_periodo(ano_prev, "Todos", "Anual Consolidada")
                 rotulo_comparativo = f"vs Budget Ant. ({ano_prev})"
 
-        # =========================================================================
-        # ISOLAMENTO DE KPIS: Leitura EXCLUSIVA da aba Budget para os Cards Superiores
-        # =========================================================================
-        
-        # 1. Orçamento Total (Garantido da aba Budget)
+        # KPIs (Isolados do Budget)
         tot_orc_kpi = b_atual["Orçado"].sum()
-        
-        # 2. Custos Realizados (Busca coluna "Realizado" no Budget; se não achar, cai pro Query2025)
         col_real_budget = next((c for c in b_atual.columns if "REALIZADO" in c or "EXECUTADO" in c), None)
         if col_real_budget:
             b_atual[col_real_budget] = b_atual[col_real_budget].apply(normalizar_valor)
             tot_real_kpi = b_atual[col_real_budget].sum()
-            # Se a coluna existir mas estiver zerada, aciona fallback
             if tot_real_kpi == 0: tot_real_kpi = l_atual["Realizado"].sum()
         else:
             tot_real_kpi = l_atual["Realizado"].sum()
             
-        # 3. Receita MRR (Busca "Receita" no Budget; se não achar, usa o input manual)
         col_rec_budget = next((c for c in b_atual.columns if "RECEITA" in c or "MRR" in c or "FATURAMENTO" in c), None)
         if col_rec_budget:
             b_atual[col_rec_budget] = b_atual[col_rec_budget].apply(normalizar_valor)
@@ -204,7 +195,6 @@ with tab1:
         else:
             mrr_val = mrr_input
 
-        # Cálculos Derivados dos KPIs
         pct_consumo_budget = (tot_real_kpi / tot_orc_kpi * 100) if tot_orc_kpi > 0 else 0.0
         lucro_op = mrr_val - tot_real_kpi
         margem_pct = (lucro_op / mrr_val * 100) if mrr_val > 0 else 0.0
@@ -235,9 +225,7 @@ with tab1:
 
         st.markdown("---")
         
-        # =========================================================================
-        # CONSOLIDAÇÃO PARA GRÁFICOS (Segue fluxo normal Mesclado)
-        # =========================================================================
+        # Consolidação para Gráficos e Matriz
         b_grp = b_atual.groupby(["CONTA", "Nome da Conta"])["Orçado"].sum().reset_index() if not b_atual.empty else pd.DataFrame(columns=["CONTA", "Nome da Conta", "Orçado"])
         l_grp = l_atual.groupby("CONTA")["Realizado"].sum().reset_index() if not l_atual.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
@@ -277,22 +265,59 @@ with tab1:
                 st.plotly_chart(fig_forn, use_container_width=True)
 
         st.markdown("---")
+        
+        # =========================================================================
+        # MATRIZ DE CUSTOS COM DRILL-DOWN INTERATIVO
+        # =========================================================================
         st.markdown("##### 📋 Matriz de Custos")
+        st.caption("🖱️ **Drill-down (Detalhamento):** Selecione uma linha na tabela abaixo para visualizar todos os lançamentos que compõem aquele custo.")
+        
         df_bi["% Uso do Budget"] = np.where(df_bi["Orçado"] > 0, (df_bi["Realizado"] / df_bi["Orçado"]) * 100, np.where(df_bi["Realizado"] > 0, 100.0, 0))
         df_bi["% Consumo da Receita"] = np.where(mrr_val > 0, (df_bi["Realizado"] / mrr_val) * 100, 0)
         df_bi["Status"] = np.where(df_bi["Realizado"] > df_bi["Orçado"], "🔴 Estourou", np.where(df_bi["Realizado"] >= df_bi["Orçado"] * 0.85, "🟡 Alerta", "🟢 OK"))
         df_bi["Status"] = np.where((df_bi["Orçado"] == 0) & (df_bi["Realizado"] == 0), "⚪ Sem Movimento", df_bi["Status"])
         
-        st.dataframe(
-            df_bi[["Status", "Nome da Conta", "Orçado", "Realizado", "Saldo", "% Uso do Budget", "% Consumo da Receita"]].sort_values("Realizado", ascending=False),
+        # Preparação do View (Index sequencial para o evento de clique)
+        df_view = df_bi[["Status", "CONTA", "Nome da Conta", "Orçado", "Realizado", "Saldo", "% Uso do Budget", "% Consumo da Receita"]].sort_values("Realizado", ascending=False).reset_index(drop=True)
+        
+        # Captura de Evento Nativo do Streamlit (on_select)
+        event = st.dataframe(
+            df_view,
+            selection_mode="single-row",
+            on_select="rerun",
+            key="grid_matriz",
             column_config={
-                "Status": st.column_config.TextColumn("Alerta"), "Nome da Conta": st.column_config.TextColumn("Conta (Budget)"),
-                "Orçado": st.column_config.NumberColumn("Budget", format="R$ %.2f"), "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
+                "CONTA": None, # Oculta a chave SAP (usada apenas para filtrar)
+                "Status": st.column_config.TextColumn("Alerta"), 
+                "Nome da Conta": st.column_config.TextColumn("Conta (Budget)"),
+                "Orçado": st.column_config.NumberColumn("Budget", format="R$ %.2f"), 
+                "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
                 "Saldo": st.column_config.NumberColumn("Saldo", format="R$ %.2f"),
                 "% Uso do Budget": st.column_config.ProgressColumn("🔥 Consumo", format="%.1f%%", min_value=0, max_value=100),
                 "% Consumo da Receita": st.column_config.ProgressColumn("Peso Receita", format="%.2f%%", min_value=0, max_value=100)
             }, hide_index=True, use_container_width=True
         )
+
+        # Renderização Dinâmica do Detalhamento (Sub-tabela)
+        if event and len(event.selection.rows) > 0:
+            idx_selecionado = event.selection.rows[0]
+            conta_alvo = df_view.iloc[idx_selecionado]["CONTA"]
+            nome_conta = df_view.iloc[idx_selecionado]["Nome da Conta"]
+
+            st.markdown(f"###### 🔎 Composição de Custos: `{nome_conta}`")
+            
+            # Filtra do DataFrame primário de lançamentos (Query 2025)
+            df_drill = l_atual[l_atual["CONTA"] == conta_alvo].copy()
+            
+            if not df_drill.empty:
+                cols_exibicao = [c for c in ["Competência", "Fornecedor", "Centro de Custo", "Realizado", "Observações"] if c in df_drill.columns]
+                st.dataframe(
+                    df_drill[cols_exibicao].sort_values("Realizado", ascending=False),
+                    column_config={"Realizado": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f")},
+                    hide_index=True, use_container_width=True
+                )
+            else:
+                st.info("Nenhum lançamento físico associado a esta conta no período (Saldo provém exclusivamente do Planejamento/Budget).")
 
 with tab2:
     st.markdown("### Lançamento Unitário no ERP")
@@ -330,6 +355,6 @@ with tab2:
                     nova_linha = [dados_insert.get(col, "") for col in cabecalhos]
                     worksheet.append_row(nova_linha)
                     st.success("✅ Lançamento auditado e inserido com sucesso.")
-                    extrair_dados_nuvem_v5.clear() 
+                    extrair_dados_nuvem_v6.clear() 
                 except Exception as e:
                     st.error(f"🚨 Falha na transação DML: {e}")
