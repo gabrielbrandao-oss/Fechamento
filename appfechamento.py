@@ -21,11 +21,8 @@ def verificar_senha(senha_fornecida: str, hash_armazenado: str) -> bool:
         return False
 
 def sanitizar_input(texto: str) -> str:
-    """Prevenção contra XSS e injeção de caracteres de controle."""
-    if not isinstance(texto, str):
-        return ""
-    texto_limpo = html.escape(texto.strip())
-    return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', texto_limpo)
+    if not isinstance(texto, str): return ""
+    return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', html.escape(texto.strip()))
 
 st.sidebar.title("🔒 Acesso Restrito")
 senha_digitada = st.sidebar.text_input("Palavra-passe Corporativa:", type="password")
@@ -34,7 +31,7 @@ HASH_SENHA = st.secrets.get("senha_app_hash", "")
 URL_BANCO_DADOS = st.secrets.get("url_planilha", "")
 
 if not HASH_SENHA or not URL_BANCO_DADOS:
-    st.error("🚨 Falha de Configuração Crítica: Secrets ausentes. Verifique as chaves no painel.")
+    st.error("🚨 Falha Crítica: Secrets ausentes (senha_app_hash ou url_planilha).")
     st.stop()
 
 if not verificar_senha(senha_digitada, HASH_SENHA):
@@ -44,12 +41,8 @@ if not verificar_senha(senha_digitada, HASH_SENHA):
 st.sidebar.success("✅ Acesso Liberado")
 st.sidebar.markdown("---")
 
-# --- 2. CONEXÃO SEGURA COM GOOGLE SHEETS ---
-SCOPE = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+# --- 2. CONEXÃO COM GOOGLE SHEETS ---
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
 @st.cache_resource(ttl=3600)
 def get_google_client():
@@ -58,29 +51,22 @@ def get_google_client():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
         return gspread.authorize(creds)
     except Exception as e:
-        st.error("🚨 Erro Crítico na injeção de credenciais GCP.")
+        st.error("🚨 Erro na injeção de credenciais GCP.")
         st.stop()
 
-# --- 3. MOTOR DE NORMALIZAÇÃO DE DADOS ---
+# --- 3. MOTOR DE NORMALIZAÇÃO ---
 def normalizar_valor(val) -> float:
     if pd.isna(val) or val == "": return 0.0
     if isinstance(val, (int, float)): return float(val)
-    
     s = str(val).upper().replace("R$", "").strip()
     s = re.sub(r'[^\d.,-]', '', s)
     if not s or s == '-': return 0.0
-    
-    qtd_pontos = s.count('.')
-    qtd_virgulas = s.count(',')
-    
-    if qtd_pontos == 1 and qtd_virgulas == 1:
-        s = s.replace('.', '').replace(',', '.') if s.rfind(',') > s.rfind('.') else s.replace(',', '')
-    elif qtd_pontos > 1 and qtd_virgulas <= 1: s = s.replace('.', '').replace(',', '.')
-    elif qtd_virgulas > 1 and qtd_pontos <= 1: s = s.replace(',', '')
-    elif qtd_pontos == 1 and qtd_virgulas == 0 and len(s.split('.')[-1]) == 3: s = s.replace('.', '')
-    elif qtd_virgulas == 1 and qtd_pontos == 0:
-        s = s.replace(',', '') if len(s.split(',')[-1]) == 3 else s.replace(',', '.')
-        
+    qtd_p, qtd_v = s.count('.'), s.count(',')
+    if qtd_p == 1 and qtd_v == 1: s = s.replace('.', '').replace(',', '.') if s.rfind(',') > s.rfind('.') else s.replace(',', '')
+    elif qtd_p > 1 and qtd_v <= 1: s = s.replace('.', '').replace(',', '.')
+    elif qtd_v > 1 and qtd_p <= 1: s = s.replace(',', '')
+    elif qtd_p == 1 and qtd_v == 0 and len(s.split('.')[-1]) == 3: s = s.replace('.', '')
+    elif qtd_v == 1 and qtd_p == 0: s = s.replace(',', '') if len(s.split(',')[-1]) == 3 else s.replace(',', '.')
     try: return float(s)
     except ValueError: return 0.0
 
@@ -88,20 +74,18 @@ def formatar_moeda(valor: float) -> str:
     if pd.isna(valor): return "R$ 0,00"
     return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
-# --- 4. EXTRAÇÃO E TRATAMENTO (ETL) ---
+# --- 4. EXTRAÇÃO ETL (NOME ALTERADO PARA FORÇAR QUEBRA DE CACHE ANTIGO) ---
 @st.cache_data(ttl=600)
-def carregar_dados_etl():
+def extrair_dados_nuvem_v3():
     client = get_google_client()
     sheet = client.open_by_url(URL_BANCO_DADOS)
-    
     try:
         ws_lanc = sheet.worksheet("Query 2025").get_all_values()
         df_lanc = pd.DataFrame(ws_lanc[1:], columns=ws_lanc[0]) if len(ws_lanc) > 1 else pd.DataFrame()
-        
         ws_budget = sheet.worksheet("Budget").get_all_values()
         df_budget = pd.DataFrame(ws_budget[1:], columns=ws_budget[0]) if len(ws_budget) > 1 else pd.DataFrame()
     except Exception as e:
-        st.error(f"🚨 Erro de I/O no Google Sheets: {e}")
+        st.error(f"🚨 Erro de I/O: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
     if not df_lanc.empty:
@@ -111,7 +95,6 @@ def carregar_dados_etl():
         col_mes_l = next((c for c in df_lanc.columns if c in ['MÊS', 'MES', 'DATA']), None)
         df_lanc["Competência"] = pd.to_datetime(df_lanc[col_mes_l], errors='coerce').dt.strftime('%m/%Y').fillna("Sem Data") if col_mes_l else "Sem Data"
         df_lanc["Ano"] = df_lanc["Competência"].apply(lambda x: str(x).split('/')[-1] if '/' in str(x) else 'Sem Data')
-        
         col_conta_l = next((c for c in df_lanc.columns if c in ['CTA.CONTÁB./CÓD.PN', 'CONTA', 'CONTA SAP']), None)
         df_lanc["CONTA"] = df_lanc[col_conta_l].astype(str).str.strip() if col_conta_l else "Sem Conta"
         df_lanc["Fornecedor"] = df_lanc.iloc[:, 11].astype(str).str.strip() if len(df_lanc.columns) >= 12 else "Sem Fornecedor"
@@ -123,14 +106,13 @@ def carregar_dados_etl():
         col_mes_b = next((c for c in df_budget.columns if c in ['MÊS', 'MES', 'DATA', 'COMPETÊNCIA', 'PERÍODO']), None)
         df_budget["Competência"] = pd.to_datetime(df_budget[col_mes_b], errors='coerce').dt.strftime('%m/%Y').fillna("Sem Data") if col_mes_b else "Sem Data"
         df_budget["Ano"] = df_budget["Competência"].apply(lambda x: str(x).split('/')[-1] if '/' in str(x) else 'Sem Data')
-        
         col_conta_b = next((c for c in df_budget.columns if c in ['CONTA', 'CONTA SAP', 'CÓDIGO', 'CTA.CONTÁB./CÓD.PN']), None)
         df_budget["CONTA"] = df_budget[col_conta_b].astype(str).str.strip() if col_conta_b else "Sem Conta"
         df_budget["Nome da Conta"] = df_budget.iloc[:, 2].astype(str).str.strip() if len(df_budget.columns) >= 3 else df_budget["CONTA"]
 
     return df_lanc, df_budget
 
-df_lanc, df_budget = carregar_dados_etl()
+df_lanc, df_budget = extrair_dados_nuvem_v3()
 
 # --- 5. INTERFACE DO USUÁRIO ---
 tab1, tab2 = st.tabs(["👔 Visão Executiva (CFO)", "📥 Inserir Lançamento"])
@@ -139,7 +121,8 @@ with tab1:
     if not df_lanc.empty or not df_budget.empty:
         st.markdown("### 🎛️ Motor de Filtros Analíticos")
         
-        anos_disponiveis = sorted(list(set(df_lanc["Ano"].dropna().unique().tolist() + df_budget["Ano"].dropna().unique().tolist())), reverse=True)
+        # 1. ANCORAGEM NO BUDGET: Anos extraídos exclusivamente da aba Budget
+        anos_disponiveis = sorted(list(set(df_budget["Ano"].dropna().astype(str).tolist())), reverse=True)
         anos_disponiveis = [a for a in anos_disponiveis if a.isdigit()]
         if not anos_disponiveis: anos_disponiveis = [str(datetime.now().year)]
 
@@ -153,21 +136,20 @@ with tab1:
             
         with col_f3:
             if tipo_visao == "Mensal":
-                meses_l = df_lanc[df_lanc["Ano"] == ano_alvo]["Competência"].unique().tolist()
-                meses_b = df_budget[df_budget["Ano"] == ano_alvo]["Competência"].unique().tolist()
-                meses_disp = sorted(list(set(meses_l + meses_b)))
-                meses_disp = [m for m in meses_disp if '/' in m]
+                # 2. ANCORAGEM NO BUDGET: Meses extraídos exclusivamente da aba Budget para o ano selecionado
+                meses_disp = sorted(list(set(df_budget[df_budget["Ano"] == ano_alvo]["Competência"].dropna().tolist())))
+                meses_disp = [m for m in meses_disp if '/' in str(m)]
                 mes_alvo = st.selectbox("📆 Mês Alvo:", meses_disp, index=len(meses_disp)-1 if meses_disp else 0)
             else:
                 mes_alvo = "Todos"
-                st.info(f"Visão Jan-Dez ({ano_alvo})")
+                st.info(f"Visão Consolidada ({ano_alvo})")
                 
         with col_f4:
             mrr_input = st.number_input(f"💰 Receita/MRR do Período ({'Mês' if tipo_visao == 'Mensal' else 'Ano'})", min_value=0.0, format="%.2f")
 
         st.markdown("---")
         
-        # Lógica de Filtragem (Atual)
+        # Filtros de Período Atual
         def filtrar_periodo(ano, mes, visao):
             b = df_budget[df_budget["Competência"] == mes] if visao == "Mensal" else df_budget[df_budget["Ano"] == ano]
             l = df_lanc[df_lanc["Competência"] == mes] if visao == "Mensal" else df_lanc[df_lanc["Ano"] == ano]
@@ -175,8 +157,8 @@ with tab1:
 
         b_atual, l_atual = filtrar_periodo(ano_alvo, mes_alvo, tipo_visao)
         
-        # Lógica de Filtragem (Período Anterior - Apenas para avaliar crescimento do Orçamento)
-        b_prev, l_prev = pd.DataFrame(), pd.DataFrame()
+        # Filtros de Período Anterior (Para Deltas do Budget)
+        b_prev = pd.DataFrame()
         rotulo_comparativo = ""
         
         if tipo_visao == "Mensal" and 'meses_disp' in locals() and mes_alvo in meses_disp:
@@ -192,7 +174,7 @@ with tab1:
                 b_prev, _ = filtrar_periodo(ano_prev, "Todos", "Anual Consolidada")
                 rotulo_comparativo = f"vs Budget Ant. ({ano_prev})"
 
-        # Agrupamento e Consolidação
+        # Consolidação
         b_grp = b_atual.groupby(["CONTA", "Nome da Conta"])["Orçado"].sum().reset_index() if not b_atual.empty else pd.DataFrame(columns=["CONTA", "Nome da Conta", "Orçado"])
         l_grp = l_atual.groupby("CONTA")["Realizado"].sum().reset_index() if not l_atual.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
@@ -201,34 +183,35 @@ with tab1:
         df_bi["Nome da Conta"] = np.where(df_bi["Nome da Conta"] == 0, df_bi["CONTA"], df_bi["Nome da Conta"])
         df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
         
-        # Métricas Globais
         tot_orc = df_bi["Orçado"].sum()
         tot_real = df_bi["Realizado"].sum()
-        
         pct_consumo_budget = (tot_real / tot_orc * 100) if tot_orc > 0 else 0.0
         lucro_op = mrr_input - tot_real
         margem_pct = (lucro_op / mrr_input * 100) if mrr_input > 0 else 0.0
 
-        # --- NOVOS DELTAS ESTRATÉGICOS (Foco em aderência ao Budget) ---
-        # 1. Delta dos Custos: Compara os Custos Realizados contra o Orçamento (Budget) do mesmo período
+        # --- REGRAS ESTritas DE DELTAS (Comparando sempre contra o Budget) ---
+        
+        # Delta 1: Custos Realizados contra o Budget do mês ALVO.
         if tot_orc > 0:
-            var_custos_vs_budget = ((tot_real - tot_orc) / tot_orc) * 100
-            delta_real_vs_orc = f"{var_custos_vs_budget:+.1f}% vs Orçamento"
+            var_custos = ((tot_real - tot_orc) / tot_orc) * 100
+            delta_real_vs_orc = f"{var_custos:+.1f}% vs Orçamento Atual"
         else:
-            delta_real_vs_orc = None
-            
-        # 2. Delta do Orçamento: Avalia se a régua do Orçamento atual cresceu ou caiu em relação ao período anterior
-        tot_orc_prev = b_prev["Orçado"].sum() if not b_prev.empty else 0.0
-        delta_orc_pct = f"{((tot_orc - tot_orc_prev) / tot_orc_prev * 100):+.1f}% {rotulo_comparativo}" if tot_orc_prev > 0 else None
+            delta_real_vs_orc = "Sem Orçamento Base"
 
-        # 3. Tratamento defensivo da Margem para o Streamlit (Evita seta fantasma)
+        # Delta 2: Crescimento/Queda da régua do Orçamento contra o Budget do mês ANTERIOR.
+        tot_orc_prev = b_prev["Orçado"].sum() if not b_prev.empty else 0.0
+        if tot_orc_prev > 0:
+            delta_orc_pct = f"{((tot_orc - tot_orc_prev) / tot_orc_prev * 100):+.1f}% {rotulo_comparativo}"
+        else:
+            delta_orc_pct = None
+
+        # Delta 3: Ocultar seta de lucro caso não haja preenchimento de MRR.
         delta_lucro = f"{margem_pct:.1f}% de Margem" if mrr_input > 0 else None
 
+        # --- RENDERIZAÇÃO DOS KPIS ---
         st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
         k1, k2, k3 = st.columns(3)
         k1.metric("Receita Declarada (MRR)", formatar_moeda(mrr_input))
-        
-        # Invertido: Custos abaixo do Budget = Verde (Economia). Acima = Vermelho (Estouro).
         k2.metric("Custos Totais Realizados", formatar_moeda(tot_real), delta=delta_real_vs_orc, delta_color="inverse")
         k3.metric("Lucro Operacional Estimado", formatar_moeda(lucro_op), delta=delta_lucro, delta_color="normal")
 
@@ -351,6 +334,6 @@ with tab2:
                     nova_linha = [dados_insert.get(col, "") for col in cabecalhos]
                     worksheet.append_row(nova_linha)
                     st.success("✅ Lançamento auditado e inserido com sucesso.")
-                    carregar_dados_etl.clear() 
+                    extrair_dados_nuvem_v3.clear() 
                 except Exception as e:
                     st.error(f"🚨 Falha na transação DML: {e}")
