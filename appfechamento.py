@@ -139,7 +139,6 @@ with tab1:
     if not df_lanc.empty or not df_budget.empty:
         st.markdown("### 🎛️ Motor de Filtros Analíticos")
         
-        # Consolidação de Anos Disponíveis
         anos_disponiveis = sorted(list(set(df_lanc["Ano"].dropna().unique().tolist() + df_budget["Ano"].dropna().unique().tolist())), reverse=True)
         anos_disponiveis = [a for a in anos_disponiveis if a.isdigit()]
         if not anos_disponiveis: anos_disponiveis = [str(datetime.now().year)]
@@ -168,16 +167,15 @@ with tab1:
 
         st.markdown("---")
         
-        # --- LÓGICA DE FILTRAGEM (ATUAL E PERÍODO ANTERIOR) ---
+        # Lógica de Filtragem (Atual)
         def filtrar_periodo(ano, mes, visao):
             b = df_budget[df_budget["Competência"] == mes] if visao == "Mensal" else df_budget[df_budget["Ano"] == ano]
             l = df_lanc[df_lanc["Competência"] == mes] if visao == "Mensal" else df_lanc[df_lanc["Ano"] == ano]
             return b.copy(), l.copy()
 
-        # Dados Período Atual
         b_atual, l_atual = filtrar_periodo(ano_alvo, mes_alvo, tipo_visao)
         
-        # Dados Período Anterior (Para cálculo de Deltas/Comparativos)
+        # Lógica de Filtragem (Período Anterior - Apenas para avaliar crescimento do Orçamento)
         b_prev, l_prev = pd.DataFrame(), pd.DataFrame()
         rotulo_comparativo = ""
         
@@ -185,16 +183,16 @@ with tab1:
             idx = meses_disp.index(mes_alvo)
             if idx > 0:
                 mes_prev = meses_disp[idx - 1]
-                b_prev, l_prev = filtrar_periodo(ano_alvo, mes_prev, "Mensal")
-                rotulo_comparativo = f"vs Mês Ant. ({mes_prev})"
+                b_prev, _ = filtrar_periodo(ano_alvo, mes_prev, "Mensal")
+                rotulo_comparativo = f"vs Budget Ant. ({mes_prev})"
         elif tipo_visao == "Anual Consolidada" and ano_alvo in anos_disponiveis:
             idx = anos_disponiveis.index(ano_alvo)
-            if idx + 1 < len(anos_disponiveis): # Como está reverse=True, o +1 é o ano anterior
+            if idx + 1 < len(anos_disponiveis):
                 ano_prev = anos_disponiveis[idx + 1]
-                b_prev, l_prev = filtrar_periodo(ano_prev, "Todos", "Anual Consolidada")
-                rotulo_comparativo = f"vs Ano Ant. ({ano_prev})"
+                b_prev, _ = filtrar_periodo(ano_prev, "Todos", "Anual Consolidada")
+                rotulo_comparativo = f"vs Budget Ant. ({ano_prev})"
 
-        # Consolidação Final (Current)
+        # Agrupamento e Consolidação
         b_grp = b_atual.groupby(["CONTA", "Nome da Conta"])["Orçado"].sum().reset_index() if not b_atual.empty else pd.DataFrame(columns=["CONTA", "Nome da Conta", "Orçado"])
         l_grp = l_atual.groupby("CONTA")["Realizado"].sum().reset_index() if not l_atual.empty else pd.DataFrame(columns=["CONTA", "Realizado"])
         
@@ -203,26 +201,36 @@ with tab1:
         df_bi["Nome da Conta"] = np.where(df_bi["Nome da Conta"] == 0, df_bi["CONTA"], df_bi["Nome da Conta"])
         df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
         
-        # Métricas Master
+        # Métricas Globais
         tot_orc = df_bi["Orçado"].sum()
         tot_real = df_bi["Realizado"].sum()
-        tot_real_prev = l_prev["Realizado"].sum() if not l_prev.empty else 0.0
-        tot_orc_prev = b_prev["Orçado"].sum() if not b_prev.empty else 0.0
         
         pct_consumo_budget = (tot_real / tot_orc * 100) if tot_orc > 0 else 0.0
         lucro_op = mrr_input - tot_real
         margem_pct = (lucro_op / mrr_input * 100) if mrr_input > 0 else 0.0
 
-        # Cálculo de Deltas (% de variação)
-        delta_real_pct = f"{((tot_real - tot_real_prev) / tot_real_prev * 100):+.1f}% {rotulo_comparativo}" if tot_real_prev > 0 else None
+        # --- NOVOS DELTAS ESTRATÉGICOS (Foco em aderência ao Budget) ---
+        # 1. Delta dos Custos: Compara os Custos Realizados contra o Orçamento (Budget) do mesmo período
+        if tot_orc > 0:
+            var_custos_vs_budget = ((tot_real - tot_orc) / tot_orc) * 100
+            delta_real_vs_orc = f"{var_custos_vs_budget:+.1f}% vs Orçamento"
+        else:
+            delta_real_vs_orc = None
+            
+        # 2. Delta do Orçamento: Avalia se a régua do Orçamento atual cresceu ou caiu em relação ao período anterior
+        tot_orc_prev = b_prev["Orçado"].sum() if not b_prev.empty else 0.0
         delta_orc_pct = f"{((tot_orc - tot_orc_prev) / tot_orc_prev * 100):+.1f}% {rotulo_comparativo}" if tot_orc_prev > 0 else None
+
+        # 3. Tratamento defensivo da Margem para o Streamlit (Evita seta fantasma)
+        delta_lucro = f"{margem_pct:.1f}% de Margem" if mrr_input > 0 else None
 
         st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
         k1, k2, k3 = st.columns(3)
         k1.metric("Receita Declarada (MRR)", formatar_moeda(mrr_input))
-        # Para custos, aumento (positivo) é ruim (vermelho), queda é bom (verde). O Streamlit inverte isso usando delta_color="inverse".
-        k2.metric("Custos Totais Realizados", formatar_moeda(tot_real), delta=delta_real_pct, delta_color="inverse")
-        k3.metric("Lucro Operacional Estimado", formatar_moeda(lucro_op), f"{margem_pct:.1f}% de Margem" if mrr_input > 0 else "---", delta_color="normal")
+        
+        # Invertido: Custos abaixo do Budget = Verde (Economia). Acima = Vermelho (Estouro).
+        k2.metric("Custos Totais Realizados", formatar_moeda(tot_real), delta=delta_real_vs_orc, delta_color="inverse")
+        k3.metric("Lucro Operacional Estimado", formatar_moeda(lucro_op), delta=delta_lucro, delta_color="normal")
 
         st.markdown("##### 🎯 Consumo de Budget Global")
         b1, b2, b3 = st.columns(3)
