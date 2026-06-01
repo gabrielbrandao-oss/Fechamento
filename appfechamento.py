@@ -32,9 +32,7 @@ class SecurityManager:
     @staticmethod
     def sanitizar_input(texto: str) -> str:
         if not isinstance(texto, str): return ""
-        # Prevenção rigorosa contra XSS e injeção de caracteres de controle
-        sanitizado = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', html.escape(texto.strip()))
-        return sanitizado
+        return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', html.escape(texto.strip()))
 
     @staticmethod
     def validar_ambiente() -> tuple[str, str]:
@@ -91,10 +89,8 @@ class FinanceRepository:
 
     @staticmethod
     def otimizar_tipagem_moeda(serie: pd.Series) -> pd.Series:
-        """Vetorização de limpeza de strings financeiras para performance (O(1) a nível de C)"""
         s = serie.astype(str).str.upper().str.replace("R$", "", regex=False).str.strip()
         s = s.str.replace(r'[^\d,-]', '', regex=True)
-        # Padronização de separadores milhar/decimal padrão BRL para Float
         s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
         return pd.to_numeric(s, errors='coerce').fillna(0.0)
 
@@ -108,7 +104,7 @@ class FinanceRepository:
             df_lanc = pd.DataFrame(ws_lanc[1:], columns=ws_lanc[0]) if len(ws_lanc) > 1 else pd.DataFrame()
             df_budget = pd.DataFrame(ws_budget[1:], columns=ws_budget[0]) if len(ws_budget) > 1 else pd.DataFrame()
             
-            # --- Transformação Vetorizada de Lançamentos ---
+            # --- Transformação de Lançamentos Realizados ---
             if not df_lanc.empty:
                 df_lanc.columns = df_lanc.columns.str.strip().str.upper()
                 col_val = "DÉBITO/CRÉDITO (MC)" if "DÉBITO/CRÉDITO (MC)" in df_lanc.columns else df_lanc.columns[0]
@@ -125,11 +121,27 @@ class FinanceRepository:
                 df_lanc["CONTA"] = df_lanc[col_conta].astype(str).str.strip() if col_conta else "Sem Conta"
                 df_lanc["Fornecedor"] = df_lanc.iloc[:, 11].astype(str).str.strip() if len(df_lanc.columns) >= 12 else "Sem Fornecedor"
 
-            # --- Transformação Vetorizada de Budget ---
+            # --- Transformação da Aba de Budget (Orçado, Realizado embutido e Receitas) ---
             if not df_budget.empty:
                 df_budget.columns = df_budget.columns.str.strip().str.upper()
+                
+                # 1. Mapeamento e parsing do Orçamento puro
                 col_val_b = next((c for c in df_budget.columns if c in ['BUDGET', 'ORÇADO', 'ORCAMENTO', 'VALOR']), None)
                 df_budget["Orçado"] = FinanceRepository.otimizar_tipagem_moeda(df_budget[col_val_b]) if col_val_b else 0.0
+                
+                # 2. EXTRAÇÃO MANDATÓRIA DO REALIZADO DE DENTRO DA ABA BUDGET
+                col_real_b = next((c for c in df_budget.columns if any(p in c for p in ["REALIZADO", "EXECUTADO", "GASTO"])), None)
+                if col_real_b:
+                    df_budget["Realizado_Fisico"] = FinanceRepository.otimizar_tipagem_moeda(df_budget[col_real_b])
+                else:
+                    df_budget["Realizado_Fisico"] = 0.0
+
+                # 3. EXTRAÇÃO MANDATÓRIA DA RECEITA / MRR DE DENTRO DA ABA BUDGET
+                col_rec_b = next((c for c in df_budget.columns if any(p in c for p in ["RECEITA", "MRR", "FATURAMENTO", "PROVENTO"])), None)
+                if col_rec_b:
+                    df_budget["Receita_Fisica"] = FinanceRepository.otimizar_tipagem_moeda(df_budget[col_rec_b])
+                else:
+                    df_budget["Receita_Fisica"] = 0.0
                 
                 col_mes_b = next((c for c in df_budget.columns if c in ['MÊS', 'MES', 'DATA', 'COMPETÊNCIA', 'PERÍODO']), None)
                 if col_mes_b:
@@ -149,14 +161,13 @@ class FinanceRepository:
             return pd.DataFrame(), pd.DataFrame()
 
     def inserir_lancamento(self, payload: dict) -> bool:
-        """Injeção DML segura via append_row."""
         try:
             sheet = self.client.open_by_url(self.url_banco)
             worksheet = sheet.worksheet("Query 2025")
             cabecalhos = worksheet.row_values(1)
             nova_linha = [payload.get(col, "") for col in cabecalhos]
             worksheet.append_row(nova_linha)
-            self.extrair_dados.clear() # Invalida o cache
+            self.extrair_dados.clear()
             return True
         except Exception as e:
             logger.error(f"Falha de gravação DML: {e}")
@@ -169,8 +180,16 @@ def formatar_moeda(valor: float) -> str:
 
 def renderizar_kpis(b_atual, l_atual, b_prev, mrr_input, rotulo_comparativo):
     tot_orc_kpi = b_atual["Orçado"].sum()
-    tot_real_kpi = l_atual["Realizado"].sum()
-    mrr_val = mrr_input
+    
+    # Prioridade Máxima: Extrai Realizado e Receita nativos da aba Budget filtrada
+    tot_real_kpi = b_atual["Realizado_Fisico"].sum()
+    mrr_val = b_atual["Receita_Fisica"].sum()
+
+    # Fallbacks estruturais caso a aba Budget esteja sem colunas preenchidas
+    if tot_real_kpi == 0: 
+        tot_real_kpi = l_atual["Realizado"].sum()
+    if mrr_val == 0: 
+        mrr_val = mrr_input
 
     pct_consumo_budget = (tot_real_kpi / tot_orc_kpi * 100) if tot_orc_kpi > 0 else 0.0
     lucro_op = mrr_val - tot_real_kpi
@@ -182,7 +201,7 @@ def renderizar_kpis(b_atual, l_atual, b_prev, mrr_input, rotulo_comparativo):
 
     st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
     k1, k2, k3 = st.columns(3)
-    k1.metric("Receita Declarada", formatar_moeda(mrr_val))
+    k1.metric("Receita Declarada (Aba Budget)", formatar_moeda(mrr_val))
     k2.metric("Custos Totais Realizados", formatar_moeda(tot_real_kpi), delta=delta_real_vs_orc, delta_color="inverse")
     k3.metric("Lucro Operacional Estimado", formatar_moeda(lucro_op), delta=f"{margem_pct:.1f}% de Margem", delta_color="normal")
 
@@ -223,16 +242,14 @@ def main():
                 mes_alvo = "Todos"
                 st.info(f"Consolidado ({ano_alvo})")
         with col_f4:
-            mrr_input = st.number_input(f"💰 Receita Manual (Opcional)", min_value=0.0, format="%.2f")
+            mrr_input = st.number_input(f"💰 Receita Manual (Fallback)", min_value=0.0, format="%.2f")
 
         st.markdown("---")
 
-        # Filtragem Estruturada
         mask_b = df_budget["Competência"] == mes_alvo if tipo_visao == "Mensal" else df_budget["Ano"] == ano_alvo
         mask_l = df_lanc["Competência"] == mes_alvo if tipo_visao == "Mensal" else df_lanc["Ano"] == ano_alvo
         b_atual, l_atual = df_budget[mask_b], df_lanc[mask_l]
 
-        # Resolução de Período Anterior
         b_prev, rotulo_comparativo = pd.DataFrame(), ""
         if tipo_visao == "Mensal" and 'meses_disp' in locals() and mes_alvo in meses_disp:
             idx = meses_disp.index(mes_alvo)
@@ -245,29 +262,36 @@ def main():
                 b_prev = df_budget[df_budget["Ano"] == anos_disponiveis[idx + 1]]
                 rotulo_comparativo = f"vs Ant. ({anos_disponiveis[idx + 1]})"
 
-        # KPIs
+        # KPIs Alimentados prioritariamente pela aba Budget
         tot_real_kpi, lucro_op = renderizar_kpis(b_atual, l_atual, b_prev, mrr_input, rotulo_comparativo)
         st.markdown("---")
 
-        # Processamento de Matriz de Custos
-        b_grp = b_atual.groupby(["CONTA", "Nome da Conta"], as_index=False)["Orçado"].sum()
+        # Processamento da Matriz Unificada usando colunas calculadas do Budget
+        b_grp = b_atual.groupby(["CONTA", "Nome da Conta"], as_index=False)[["Orçado", "Realizado_Fisico"]].sum()
+        b_grp.rename(columns={"Realizado_Fisico": "Realizado_Budget"}, inplace=True)
+        
         l_grp = l_atual.groupby("CONTA", as_index=False)["Realizado"].sum()
-        df_bi = pd.merge(b_grp, l_grp, on="CONTA", how="outer").fillna({"Orçado": 0, "Realizado": 0})
-        df_bi = df_bi[(df_bi["Orçado"] != 0) | (df_bi["Realizado"] != 0)]
+        
+        df_bi = pd.merge(b_grp, l_grp, on="CONTA", how="outer").fillna({"Orçado": 0, "Realizado_Budget": 0, "Realizado": 0})
+        df_bi = df_bi[(df_bi["Orçado"] != 0) | (df_bi["Realizado_Budget"] != 0) | (df_bi["Realizado"] != 0)]
+        
+        # Consolida para visualização: Usa o Realizado do Budget. Se zerado, assume o Realizado dos Lançamentos físicos.
+        df_bi["Realizado_Final"] = np.where(df_bi["Realizado_Budget"] > 0, df_bi["Realizado_Budget"], df_bi["Realizado"])
         df_bi["Nome da Conta"] = np.where(df_bi["Nome da Conta"].isna() | (df_bi["Nome da Conta"] == 0), df_bi["CONTA"], df_bi["Nome da Conta"])
-        df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado"]
+        df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado_Final"]
 
-        # Gráficos
         c1, c2 = st.columns([3, 2])
         with c1:
-            df_chart1 = df_bi.nlargest(10, "Realizado")
-            fig_vs = px.bar(df_chart1, x="Nome da Conta", y=["Orçado", "Realizado"], barmode="group", title="Orçamento vs Execução (Top 10)", color_discrete_map={"Orçado": "#1f77b4", "Realizado": "#ff7f0e"})
+            df_chart1 = df_bi.nlargest(10, "Realizado_Final")
+            fig_vs = px.bar(df_chart1, x="Nome da Conta", y=["Orçado", "Realizado_Final"], barmode="group", title="Orçamento vs Execução (Top 10)", color_discrete_map={"Orçado": "#1f77b4", "Realizado_Final": "#ff7f0e"})
             fig_vs.update_layout(margin=dict(t=40, b=0, l=0, r=0), legend_title_text="")
             st.plotly_chart(fig_vs, use_container_width=True)
         with c2:
+            # Captura dinâmica da Receita calculada no motor de KPI
+            mrr_calculado = b_atual["Receita_Fisica"].sum() or mrr_input
             fig_wf = go.Figure(go.Waterfall(
-                measure=["relative", "relative", "total"], x=["Receita", "Custos", "Resultado"], y=[mrr_input, -tot_real_kpi, lucro_op],
-                text=[f"R$ {mrr_input:,.0f}", f"R$ {-tot_real_kpi:,.0f}", f"R$ {lucro_op:,.0f}"], textposition="outside",
+                measure=["relative", "relative", "total"], x=["Receita", "Custos", "Resultado"], y=[mrr_calculado, -tot_real_kpi, lucro_op],
+                text=[f"R$ {mrr_calculado:,.0f}", f"R$ {-tot_real_kpi:,.0f}", f"R$ {lucro_op:,.0f}"], textposition="outside",
                 decreasing={"marker": {"color": "#d62728"}}, increasing={"marker": {"color": "#2ca02c"}}, totals={"marker": {"color": "#1f77b4"}}
             ))
             fig_wf.update_layout(title="Formação do Resultado", margin=dict(t=40, b=0, l=0, r=0))
@@ -276,13 +300,16 @@ def main():
         st.markdown("---")
         st.markdown("##### 📋 Matriz de Custos com Drill-Down")
         
-        df_bi["% Uso do Budget"] = np.where(df_bi["Orçado"] > 0, (df_bi["Realizado"] / df_bi["Orçado"]) * 100, np.where(df_bi["Realizado"] > 0, 100.0, 0))
-        df_bi["% Consumo da Receita"] = np.where(mrr_input > 0, (df_bi["Realizado"] / mrr_input) * 100, 0)
+        df_bi["% Uso do Budget"] = np.where(df_bi["Orçado"] > 0, (df_bi["Realizado_Final"] / df_bi["Orçado"]) * 100, np.where(df_bi["Realizado_Final"] > 0, 100.0, 0))
+        mrr_global = b_atual["Receita_Fisica"].sum() or mrr_input
+        df_bi["% Consumo da Receita"] = np.where(mrr_global > 0, (df_bi["Realizado_Final"] / mrr_global) * 100, 0)
+        
         df_bi["Status"] = np.select(
-            [df_bi["Realizado"] > df_bi["Orçado"], df_bi["Realizado"] >= df_bi["Orçado"] * 0.85, (df_bi["Orçado"] == 0) & (df_bi["Realizado"] == 0)],
+            [df_bi["Realizado_Final"] > df_bi["Orçado"], df_bi["Realizado_Final"] >= df_bi["Orçado"] * 0.85, (df_bi["Orçado"] == 0) & (df_bi["Realizado_Final"] == 0)],
             ["🔴 Estourou", "🟡 Alerta", "⚪ Sem Movimento"], default="🟢 OK"
         )
-        df_view = df_bi[["Status", "CONTA", "Nome da Conta", "Orçado", "Realizado", "Saldo", "% Uso do Budget", "% Consumo da Receita"]].sort_values("Realizado", ascending=False).reset_index(drop=True)
+        df_view = df_bi[["Status", "CONTA", "Nome da Conta", "Orçado", "Realizado_Final", "Saldo", "% Uso do Budget", "% Consumo da Receita"]].sort_values("Realizado_Final", ascending=False).reset_index(drop=True)
+        df_view.rename(columns={"Realizado_Final": "Realizado"}, inplace=True)
 
         event = st.dataframe(
             df_view, selection_mode="single-row", on_select="rerun", key="grid_matriz", hide_index=True, use_container_width=True,
@@ -298,11 +325,16 @@ def main():
         if event and event.selection.rows:
             linha_sel = df_view.iloc[event.selection.rows[0]]
             st.markdown(f"###### 🔎 Detalhamento: `{linha_sel['Nome da Conta']}`")
-            df_drill = l_atual[l_atual["CONTA"] == linha_sel["CONTA"]][["Competência", "Fornecedor", "Centro de Custo", "Realizado", "Observações"]].dropna(axis=1, how='all')
+            
+            colunas_alvo = ["Competência", "Fornecedor", "CENTRO DE CUSTO", "Realizado", "OBSERVAÇÕES"]
+            colunas_seguras = [c for c in colunas_alvo if c in l_atual.columns]
+            
+            df_drill = l_atual[l_atual["CONTA"] == linha_sel["CONTA"]][colunas_seguras].dropna(axis=1, how='all')
+            
             if not df_drill.empty:
                 st.dataframe(df_drill.sort_values("Realizado", ascending=False), hide_index=True, use_container_width=True, column_config={"Realizado": st.column_config.NumberColumn("Valor", format="R$ %.2f")})
             else:
-                st.info("Nenhum lançamento físico detectado para este período.")
+                st.info("Nenhum lançamento físico detectado em Query 2025 para este período (Métricas extraídas via Planejamento de Budget).")
 
     with tab_form:
         st.markdown("### Lançamento Unitário no ERP")
@@ -322,7 +354,7 @@ def main():
                 fornecedor_san = SecurityManager.sanitizar_input(fornecedor)
                 
                 if not conta_sap_san or not fornecedor_san:
-                    st.error("🚨 Entradas inválidas: Campos obrigatórios ausentes ou contendo caracteres proibidos.")
+                    st.error("🚨 Entradas inválidas: Campos obrigatórios ausentes.")
                 else:
                     with st.spinner("Gravando e gerando trilha de auditoria..."):
                         payload = {
