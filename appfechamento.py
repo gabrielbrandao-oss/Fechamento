@@ -1,370 +1,689 @@
-# file: app_fechamento_secure.py
+# app_facilities.py — Dashboard Facilities Cobli
+# Mesma identidade visual do HTML: dark mode, cores Cobli, Chart.js → Plotly
+# Lê via gspread (service account) — funciona com planilha privada
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import bcrypt
-import re
-from datetime import datetime
-import html
-import plotly.express as px
 import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime
 import logging
+import re, html as _html
 
-# Configuração de Logs Auditáveis
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="Portal Financeiro Corporativo", layout="wide", page_icon="🏢")
+# ─── TEMA COBLI (idêntico ao HTML) ───────────────────────────────────────────
+st.set_page_config(
+    page_title="Dashboard Facilities · Cobli",
+    page_icon="🏢",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-# --- 1. CAMADA DE SEGURANÇA E AUTENTICAÇÃO (APPSEC) ---
-class SecurityManager:
-    @staticmethod
-    def verificar_senha(senha_fornecida: str, hash_armazenado: str) -> bool:
-        if not senha_fornecida or not hash_armazenado: return False
-        try:
-            return bcrypt.checkpw(senha_fornecida.encode('utf-8'), hash_armazenado.encode('utf-8'))
-        except ValueError:
-            logger.warning("Tentativa de bypass ou hash malformado detectado.")
-            return False
+DARK_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-    @staticmethod
-    def sanitizar_input(texto: str) -> str:
-        if not isinstance(texto, str): return ""
-        return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', html.escape(texto.strip()))
+/* Reset Streamlit para dark Cobli */
+html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+    background-color: #0d1117 !important;
+    color: #e6edf3 !important;
+    font-family: 'Inter', -apple-system, sans-serif !important;
+}
+[data-testid="stSidebar"]  { background: #161b22 !important; }
+[data-testid="stHeader"]   { background: #0d1117 !important; }
+[data-testid="stToolbar"]  { display: none; }
+footer                     { display: none; }
 
-    @staticmethod
-    def validar_ambiente() -> tuple[str, str]:
-        hash_senha = st.secrets.get("senha_app_hash")
-        url_bd = st.secrets.get("url_planilha")
-        if not hash_senha or not url_bd:
-            st.error("🚨 Falha Crítica: Variáveis de ambiente ausentes. Sistema bloqueado por segurança.")
-            st.stop()
-        return hash_senha, url_bd
+/* Blocos de métricas */
+[data-testid="stMetric"] {
+    background: #161b22;
+    border: 1px solid #21283a;
+    border-radius: 10px;
+    padding: 16px 20px !important;
+}
+[data-testid="stMetricValue"]  { color: #e6edf3 !important; font-weight: 700; font-size: 1.6rem; }
+[data-testid="stMetricLabel"]  { color: #7d8590 !important; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
+[data-testid="stMetricDelta"]  { font-size: .8rem; }
 
-    @staticmethod
-    def requerer_autenticacao(hash_armazenado: str):
-        if "auth_ok" not in st.session_state:
-            st.session_state["auth_ok"] = False
+/* Tabs */
+[data-testid="stTabs"] button {
+    background: #161b22 !important;
+    color: #7d8590 !important;
+    border-bottom: 2px solid transparent !important;
+    border-radius: 0 !important;
+    font-size: .85rem;
+    font-weight: 500;
+    padding: 10px 18px;
+}
+[data-testid="stTabs"] button[aria-selected="true"] {
+    color: #2490d8 !important;
+    border-bottom-color: #2490d8 !important;
+    background: #0d1117 !important;
+}
 
-        if not st.session_state["auth_ok"]:
-            st.sidebar.title("🔒 Acesso Restrito")
-            senha_digitada = st.sidebar.text_input("Palavra-passe Corporativa:", type="password")
-            
-            if senha_digitada:
-                if SecurityManager.verificar_senha(senha_digitada, hash_armazenado):
-                    st.session_state["auth_ok"] = True
-                    st.rerun()
-                else:
-                    st.sidebar.error("⚠️ Credenciais inválidas.")
-                    logger.warning("Falha de autenticação detectada.")
-            st.stop()
-        
-        st.sidebar.success("✅ Acesso Liberado")
-        if st.sidebar.button("🚪 Encerrar Sessão"):
+/* Selectbox / inputs */
+[data-testid="stSelectbox"] > div > div,
+[data-testid="stDateInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input {
+    background: #161b22 !important;
+    border: 1px solid #21283a !important;
+    border-radius: 8px !important;
+    color: #e6edf3 !important;
+    font-size: .85rem !important;
+}
+[data-testid="stSelectbox"] svg { fill: #7d8590 !important; }
+
+/* Botões */
+[data-testid="stButton"] > button {
+    background: #1d6fa4 !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    font-size: .85rem !important;
+    padding: 8px 18px !important;
+    transition: background .15s;
+}
+[data-testid="stButton"] > button:hover { background: #2490d8 !important; }
+
+/* Dataframe / tabelas */
+[data-testid="stDataFrame"] { border: 1px solid #21283a; border-radius: 10px; overflow: hidden; }
+[data-testid="stDataFrame"] th {
+    background: #161b22 !important;
+    color: #7d8590 !important;
+    font-size: .75rem !important;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    border-bottom: 1px solid #21283a !important;
+}
+[data-testid="stDataFrame"] td { color: #e6edf3 !important; font-size: .82rem !important; border-color: #21283a !important; }
+
+/* Alertas */
+[data-testid="stAlert"] { border-radius: 8px !important; font-size: .84rem; }
+
+/* Divisores */
+hr { border-color: #21283a !important; }
+
+/* Card genérico */
+.cobli-card {
+    background: #161b22;
+    border: 1px solid #21283a;
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+}
+.cobli-title {
+    font-size: .7rem;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: #7d8590;
+    margin-bottom: 4px;
+}
+.cobli-val { font-size: 1.5rem; font-weight: 700; color: #e6edf3; }
+.cobli-sub { font-size: .75rem; color: #7d8590; margin-top: 2px; }
+.green { color: #1da462 !important; }
+.red   { color: #e85454 !important; }
+.yellow{ color: #d4a017 !important; }
+.blue  { color: #2490d8 !important; }
+
+/* Header do dashboard */
+.dash-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 20px 0 16px;
+    border-bottom: 1px solid #21283a;
+    margin-bottom: 20px;
+}
+.dash-header h1 { font-size: 1.2rem; font-weight: 700; color: #e6edf3; margin: 0; }
+.dash-header span { font-size: .8rem; color: #7d8590; }
+.badge {
+    background: rgba(29,111,164,.15);
+    color: #2490d8;
+    border: 1px solid rgba(36,144,216,.3);
+    border-radius: 20px;
+    font-size: .7rem;
+    font-weight: 600;
+    padding: 2px 10px;
+    margin-left: 8px;
+}
+</style>
+"""
+st.markdown(DARK_CSS, unsafe_allow_html=True)
+
+# ─── CORES PLOTLY (dark Cobli) ────────────────────────────────────────────────
+PLOTLY_LAYOUT = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(family="Inter, sans-serif", color="#7d8590", size=11),
+    margin=dict(t=36, b=8, l=8, r=8),
+    legend=dict(
+        orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+        font=dict(size=10), bgcolor="rgba(0,0,0,0)", borderwidth=0,
+    ),
+    xaxis=dict(gridcolor="#21283a", linecolor="#21283a", tickfont=dict(size=10)),
+    yaxis=dict(gridcolor="#21283a", linecolor="#21283a", tickfont=dict(size=10)),
+)
+
+COR_BUDGET    = "#1d6fa4"
+COR_REALIZADO = "#1da462"
+COR_DELTA     = "#d4a017"
+COR_VERMELHO  = "#e85454"
+
+PT_MONTHS = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
+def fmt_mes(dt):
+    if pd.isna(dt): return None
+    return f"{PT_MONTHS[dt.month-1]}/{str(dt.year)[2:]}"
+
+def fmt_brl(v):
+    try: return f"R$ {float(v):,.2f}".replace(",","X").replace(".",",").replace("X",".")
+    except: return "R$ 0,00"
+
+# ─── AUTENTICAÇÃO ─────────────────────────────────────────────────────────────
+def check_auth():
+    senha_cfg = st.secrets.get("senha_app", "")
+    if not senha_cfg:
+        st.error("⚠️ `senha_app` não configurada em secrets.toml")
+        st.stop()
+
+    if st.session_state.get("auth_ok"):
+        return True
+
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style='text-align:center; margin-bottom:24px;'>
+            <div style='font-size:2rem;'>🏢</div>
+            <div style='font-size:1.1rem; font-weight:700; color:#e6edf3; margin-top:8px;'>Dashboard Facilities</div>
+            <div style='font-size:.8rem; color:#7d8590; margin-top:4px;'>Cobli · Acesso restrito</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        senha = st.text_input("Senha", type="password", placeholder="Digite a senha de acesso")
+        if st.button("Entrar", use_container_width=True):
+            import bcrypt
+            try:
+                ok = bcrypt.checkpw(senha.encode(), senha_cfg.encode())
+            except Exception:
+                # Fallback: comparação direta (senha em texto plano no secrets)
+                ok = (senha == senha_cfg)
+            if ok:
+                st.session_state["auth_ok"] = True
+                st.rerun()
+            else:
+                st.error("Senha incorreta.")
+    st.stop()
+
+# ─── CONEXÃO GSPREAD ──────────────────────────────────────────────────────────
+@st.cache_resource(ttl=3600)
+def get_gspread_client():
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(
+        dict(st.secrets["gcp_service_account"]), scope
+    )
+    return gspread.authorize(creds)
+
+# ─── ETL ──────────────────────────────────────────────────────────────────────
+def parse_brl(serie: pd.Series) -> pd.Series:
+    s = serie.astype(str).str.replace("R$","",regex=False).str.strip()
+    s = s.str.replace(r'[^\d,.-]', '', regex=True)
+    s = s.str.replace('.','',regex=False).str.replace(',','.',regex=False)
+    return pd.to_numeric(s, errors='coerce').fillna(0.0)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_budget(_client, url: str) -> pd.DataFrame:
+    """Lê aba Budget e retorna DataFrame com colunas padronizadas."""
+    sheet = _client.open_by_url(url)
+    ws    = sheet.worksheet("Budget")
+    data  = ws.get_all_values()
+    if len(data) < 2:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data[1:], columns=data[0])
+    df.columns = df.columns.str.strip().str.upper()
+
+    # Mês
+    col_mes = next((c for c in df.columns if c in ['MÊS','MES','DATA','PERÍODO']), None)
+    if col_mes:
+        df["_mes_dt"] = pd.to_datetime(df[col_mes], errors='coerce')
+        df["Mes"]     = df["_mes_dt"].apply(fmt_mes)
+        df["Ano"]     = df["_mes_dt"].dt.year.astype("Int64").astype(str)
+    else:
+        df["Mes"] = df["Ano"] = "?"
+
+    # Conta
+    df["Conta"] = df.get("TIPO 1", df.iloc[:, 2]).astype(str).str.strip()
+
+    # Valores
+    col_b = next((c for c in df.columns if c == 'BUDGET'), None)
+    col_r = next((c for c in df.columns if c == 'REALIZADO'), None)
+    col_d = next((c for c in df.columns if c == 'DELTA'), None)
+    df["Budget"]    = parse_brl(df[col_b]) if col_b else 0.0
+    df["Realizado"] = parse_brl(df[col_r]) if col_r else 0.0
+    df["Delta"]     = parse_brl(df[col_d]) if col_d else (df["Budget"] - df["Realizado"])
+
+    # Tipo (filtro Facilities)
+    col_tipo = next((c for c in df.columns if c == 'TIPO'), None)
+    df["Tipo"] = df[col_tipo].astype(str).str.strip() if col_tipo else "Facilities"
+
+    # Centro de custo
+    col_cc = next((c for c in df.columns if 'CENTRO' in c), None)
+    df["CentroCusto"] = df[col_cc].astype(str).str.strip() if col_cc else ""
+
+    # Filtrar só Facilities
+    df = df[df["Tipo"].str.lower() == "facilities"].copy()
+    df = df[df["Mes"].notna() & (df["Mes"] != "None")].copy()
+    return df
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_mrr(_client, url: str) -> pd.DataFrame:
+    try:
+        sheet = _client.open_by_url(url)
+        ws    = sheet.worksheet("MRR")
+        data  = ws.get_all_values()
+        if len(data) < 2: return pd.DataFrame()
+        df = pd.DataFrame(data[1:], columns=data[0])
+        df.columns = df.columns.str.strip().str.upper()
+        col_mrr  = next((c for c in df.columns if 'MRR' in c), None)
+        col_data = next((c for c in df.columns if c in ['DATA','DATE','MÊS','MES']), None)
+        col_hc   = next((c for c in df.columns if c == 'HC'), None)
+        if not col_mrr or not col_data: return pd.DataFrame()
+        df["_dt"]  = pd.to_datetime(df[col_data], errors='coerce')
+        df["Mes"]  = df["_dt"].apply(fmt_mes)
+        df["MRR"]  = parse_brl(df[col_mrr])
+        df["HC"]   = pd.to_numeric(df[col_hc], errors='coerce').fillna(0) if col_hc else 0
+        return df[["Mes","MRR","HC"]].dropna(subset=["Mes"])
+    except Exception as e:
+        logger.warning(f"MRR não carregado: {e}")
+        return pd.DataFrame()
+
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+def mes_order(m: str) -> int:
+    if not m or m == "?": return 9999
+    try:
+        mon, yr = m.split("/")
+        return int(yr)*12 + PT_MONTHS.index(mon)
+    except: return 9999
+
+def kpi_card(label: str, value, sub: str = "", color: str = ""):
+    color_class = f' class="{color}"' if color else ''
+    st.markdown(f"""
+    <div class="cobli-card" style="min-height:80px;">
+        <div class="cobli-title">{label}</div>
+        <div class="cobli-val"{color_class}>{value}</div>
+        <div class="cobli-sub">{sub}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ─── GRÁFICOS (dark Cobli) ────────────────────────────────────────────────────
+def chart_bar_bvr(df_mes: pd.DataFrame) -> go.Figure:
+    """Budget × Realizado por mês — barras agrupadas."""
+    fig = go.Figure()
+    fig.add_bar(name="Budget",    x=df_mes["Mes"], y=df_mes["Budget"],
+                marker_color=COR_BUDGET,    marker_line_width=0,
+                hovertemplate="%{x}<br>Budget: R$ %{y:,.0f}<extra></extra>")
+    fig.add_bar(name="Realizado", x=df_mes["Mes"], y=df_mes["Realizado"],
+                marker_color=COR_REALIZADO, marker_line_width=0,
+                hovertemplate="%{x}<br>Realizado: R$ %{y:,.0f}<extra></extra>")
+    fig.update_layout(**PLOTLY_LAYOUT, barmode="group",
+                      title=dict(text="Budget × Realizado", font=dict(size=13, color="#e6edf3")))
+    return fig
+
+def chart_linha_bvr(df_mes: pd.DataFrame) -> go.Figure:
+    """Budget × Realizado por mês — linhas."""
+    fig = go.Figure()
+    fig.add_scatter(name="Budget",    x=df_mes["Mes"], y=df_mes["Budget"],
+                    mode="lines+markers", line=dict(color=COR_BUDGET, width=2),
+                    marker=dict(size=5))
+    fig.add_scatter(name="Realizado", x=df_mes["Mes"], y=df_mes["Realizado"],
+                    mode="lines+markers", line=dict(color=COR_REALIZADO, width=2),
+                    marker=dict(size=5))
+    fig.update_layout(**PLOTLY_LAYOUT,
+                      title=dict(text="Evolução Mensal", font=dict(size=13, color="#e6edf3")))
+    return fig
+
+def chart_delta(df_mes: pd.DataFrame) -> go.Figure:
+    """Delta mensal (Budget − Realizado)."""
+    cores = [COR_REALIZADO if v >= 0 else COR_VERMELHO for v in df_mes["Delta"]]
+    fig = go.Figure()
+    fig.add_bar(x=df_mes["Mes"], y=df_mes["Delta"],
+                marker_color=cores, marker_line_width=0,
+                hovertemplate="%{x}<br>Delta: R$ %{y:,.0f}<extra></extra>",
+                name="Delta")
+    fig.add_hline(y=0, line_color="#21283a", line_width=1)
+    fig.update_layout(**PLOTLY_LAYOUT,
+                      showlegend=False,
+                      title=dict(text="Delta Mensal (Budget − Realizado)", font=dict(size=13, color="#e6edf3")))
+    return fig
+
+def chart_contas(df_contas: pd.DataFrame) -> go.Figure:
+    """Top contas — barra horizontal."""
+    top = df_contas.nlargest(10, "Realizado")
+    fig = go.Figure()
+    fig.add_bar(name="Budget",    y=top["Conta"], x=top["Budget"],
+                orientation="h", marker_color=COR_BUDGET,    marker_line_width=0)
+    fig.add_bar(name="Realizado", y=top["Conta"], x=top["Realizado"],
+                orientation="h", marker_color=COR_REALIZADO, marker_line_width=0)
+    layout = {**PLOTLY_LAYOUT, "barmode": "group", "height": 340,
+              "yaxis": {**PLOTLY_LAYOUT["yaxis"], "autorange": "reversed"},
+              "title": dict(text="Top Contas · Budget vs Realizado", font=dict(size=13, color="#e6edf3"))}
+    fig.update_layout(**layout)
+    return fig
+
+def chart_mrr(df_mrr: pd.DataFrame, df_mes: pd.DataFrame) -> go.Figure:
+    """MRR × Custo Facilities."""
+    merged = pd.merge(df_mrr, df_mes[["Mes","Realizado"]], on="Mes", how="inner")
+    if merged.empty: return go.Figure()
+    fig = go.Figure()
+    fig.add_bar(name="MRR", x=merged["Mes"], y=merged["MRR"],
+                marker_color="#2490d8", marker_line_width=0, yaxis="y")
+    fig.add_scatter(name="Custo Facilities", x=merged["Mes"], y=merged["Realizado"],
+                    mode="lines+markers", line=dict(color=COR_VERMELHO, width=2),
+                    marker=dict(size=5), yaxis="y2")
+    layout = {
+        **PLOTLY_LAYOUT,
+        "yaxis":  dict(title="MRR (R$)",      side="left",  gridcolor="#21283a", tickfont=dict(size=10)),
+        "yaxis2": dict(title="Facilities (R$)", side="right", overlaying="y", gridcolor="rgba(0,0,0,0)", tickfont=dict(size=10)),
+        "title":  dict(text="MRR × Custo Facilities", font=dict(size=13, color="#e6edf3")),
+    }
+    fig.update_layout(**layout)
+    return fig
+
+def chart_centros(df_cc: pd.DataFrame) -> go.Figure:
+    """Budget × Realizado por centro de custo."""
+    fig = go.Figure()
+    fig.add_bar(name="Budget",    y=df_cc["CentroCusto"], x=df_cc["Budget"],
+                orientation="h", marker_color=COR_BUDGET,    marker_line_width=0)
+    fig.add_bar(name="Realizado", y=df_cc["CentroCusto"], x=df_cc["Realizado"],
+                orientation="h", marker_color=COR_REALIZADO, marker_line_width=0)
+    layout = {**PLOTLY_LAYOUT, "barmode": "group", "height": 300,
+              "yaxis": {**PLOTLY_LAYOUT["yaxis"], "autorange": "reversed"},
+              "title": dict(text="Centro de Custo", font=dict(size=13, color="#e6edf3"))}
+    fig.update_layout(**layout)
+    return fig
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
+    check_auth()
+
+    # Header
+    st.markdown("""
+    <div class="dash-header">
+        <div>
+            <h1>🏢 Dashboard Facilities <span class="badge">Cobli</span></h1>
+            <span>Budget × Realizado · Facilities</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Logout
+    with st.sidebar:
+        st.markdown("### 🏢 Facilities")
+        if st.button("🚪 Sair"):
             st.session_state["auth_ok"] = False
             st.rerun()
-        st.sidebar.markdown("---")
+        st.markdown("---")
+        auto_refresh = st.checkbox("🔄 Auto-refresh (60s)", value=True)
+        if auto_refresh:
+            st.markdown("""
+            <script>setTimeout(function(){window.location.reload();}, 60000);</script>
+            """, unsafe_allow_html=True)
 
-# --- 2. CAMADA DE DADOS E INFRAESTRUTURA (ETL/DML) ---
-class FinanceRepository:
-    SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    # Conectar
+    url = st.secrets.get("url_planilha","")
+    if not url:
+        st.error("⚠️ `url_planilha` não configurada em secrets.toml")
+        st.stop()
 
-    def __init__(self, url_banco: str):
-        self.url_banco = url_banco
-        self.client = self._conectar()
-
-    @staticmethod
-    @st.cache_resource(ttl=3600)
-    def _conectar():
+    with st.spinner("Lendo planilha…"):
         try:
-            creds_dict = dict(st.secrets["gcp_service_account"])
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, FinanceRepository.SCOPE)
-            return gspread.authorize(creds)
+            client  = get_gspread_client()
+            df_raw  = load_budget(client, url)
+            df_mrr  = load_mrr(client, url)
         except Exception as e:
-            logger.critical(f"Falha na injeção de credenciais GCP: {e}")
-            st.error("🚨 Erro crítico de infraestrutura. Contate o AppSec.")
+            st.error(f"Erro ao conectar: {e}")
             st.stop()
 
-    @staticmethod
-    def otimizar_tipagem_moeda(serie: pd.Series) -> pd.Series:
-        s = serie.astype(str).str.upper().str.replace("R$", "", regex=False).str.strip()
-        s = s.str.replace(r'[^\d,-]', '', regex=True)
-        s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-        return pd.to_numeric(s, errors='coerce').fillna(0.0)
+    if df_raw.empty:
+        st.warning("Nenhum dado Facilities encontrado na aba Budget.")
+        st.stop()
 
-    @st.cache_data(ttl=600)
-    def extrair_dados(_self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        try:
-            sheet = _self.client.open_by_url(_self.url_banco)
-            ws_lanc = sheet.worksheet("Query 2025").get_all_values()
-            ws_budget = sheet.worksheet("Budget").get_all_values()
-            
-            df_lanc = pd.DataFrame(ws_lanc[1:], columns=ws_lanc[0]) if len(ws_lanc) > 1 else pd.DataFrame()
-            df_budget = pd.DataFrame(ws_budget[1:], columns=ws_budget[0]) if len(ws_budget) > 1 else pd.DataFrame()
-            
-            # --- Transformação de Lançamentos Realizados ---
-            if not df_lanc.empty:
-                df_lanc.columns = df_lanc.columns.str.strip().str.upper()
-                col_val = "DÉBITO/CRÉDITO (MC)" if "DÉBITO/CRÉDITO (MC)" in df_lanc.columns else df_lanc.columns[0]
-                df_lanc["Realizado"] = FinanceRepository.otimizar_tipagem_moeda(df_lanc[col_val])
-                
-                col_mes = next((c for c in df_lanc.columns if c in ['MÊS', 'MES', 'DATA']), None)
-                if col_mes:
-                    df_lanc["Competência"] = pd.to_datetime(df_lanc[col_mes], errors='coerce').dt.strftime('%m/%Y').fillna("Sem Data")
-                else:
-                    df_lanc["Competência"] = "Sem Data"
-                    
-                df_lanc["Ano"] = df_lanc["Competência"].str.split('/').str[-1]
-                col_conta = next((c for c in df_lanc.columns if c in ['CTA.CONTÁB./CÓD.PN', 'CONTA', 'CONTA SAP']), None)
-                df_lanc["CONTA"] = df_lanc[col_conta].astype(str).str.strip() if col_conta else "Sem Conta"
-                df_lanc["Fornecedor"] = df_lanc.iloc[:, 11].astype(str).str.strip() if len(df_lanc.columns) >= 12 else "Sem Fornecedor"
+    # ── FILTROS ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+    anos_disp = sorted(df_raw["Ano"].dropna().unique(), reverse=True)
+    anos_disp = [a for a in anos_disp if str(a).isdigit()]
+    meses_todos = sorted(df_raw["Mes"].dropna().unique(), key=mes_order)
 
-            # --- Transformação da Aba de Budget (Orçado, Realizado embutido e Receitas) ---
-            if not df_budget.empty:
-                df_budget.columns = df_budget.columns.str.strip().str.upper()
-                
-                # 1. Mapeamento e parsing do Orçamento puro
-                col_val_b = next((c for c in df_budget.columns if c in ['BUDGET', 'ORÇADO', 'ORCAMENTO', 'VALOR']), None)
-                df_budget["Orçado"] = FinanceRepository.otimizar_tipagem_moeda(df_budget[col_val_b]) if col_val_b else 0.0
-                
-                # 2. EXTRAÇÃO MANDATÓRIA DO REALIZADO DE DENTRO DA ABA BUDGET
-                col_real_b = next((c for c in df_budget.columns if any(p in c for p in ["REALIZADO", "EXECUTADO", "GASTO"])), None)
-                if col_real_b:
-                    df_budget["Realizado_Fisico"] = FinanceRepository.otimizar_tipagem_moeda(df_budget[col_real_b])
-                else:
-                    df_budget["Realizado_Fisico"] = 0.0
+    fc1, fc2, fc3, fc4, fc5 = st.columns([1, 1.2, 1.4, 1.4, 1])
+    with fc1:
+        ano_sel = st.selectbox("Ano", ["Todos"] + anos_disp,
+                               index=1 if "2026" in anos_disp else 0, key="ano")
+    with fc2:
+        df_filtrado_ano = df_raw[df_raw["Ano"] == ano_sel] if ano_sel != "Todos" else df_raw
+        meses_ano = sorted(df_filtrado_ano["Mes"].dropna().unique(), key=mes_order)
+        mes_sel = st.selectbox("Mês", ["Todos"] + list(meses_ano), key="mes")
+    with fc3:
+        contas_disp = sorted(df_raw["Conta"].dropna().unique())
+        conta_sel = st.selectbox("Conta", ["Todas"] + contas_disp, key="conta")
+    with fc4:
+        cc_disp = sorted(df_raw["CentroCusto"].dropna().replace("","(sem centro)").unique())
+        cc_sel = st.selectbox("Centro de Custo", ["Todos"] + [c for c in cc_disp if c], key="cc")
+    with fc5:
+        if st.button("↺ Atualizar", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
 
-                # 3. EXTRAÇÃO MANDATÓRIA DA RECEITA / MRR DE DENTRO DA ABA BUDGET
-                col_rec_b = next((c for c in df_budget.columns if any(p in c for p in ["RECEITA", "MRR", "FATURAMENTO", "PROVENTO"])), None)
-                if col_rec_b:
-                    df_budget["Receita_Fisica"] = FinanceRepository.otimizar_tipagem_moeda(df_budget[col_rec_b])
-                else:
-                    df_budget["Receita_Fisica"] = 0.0
-                
-                col_mes_b = next((c for c in df_budget.columns if c in ['MÊS', 'MES', 'DATA', 'COMPETÊNCIA', 'PERÍODO']), None)
-                if col_mes_b:
-                    df_budget["Competência"] = pd.to_datetime(df_budget[col_mes_b], errors='coerce').dt.strftime('%m/%Y').fillna("Sem Data")
-                else:
-                    df_budget["Competência"] = "Sem Data"
-                    
-                df_budget["Ano"] = df_budget["Competência"].str.split('/').str[-1]
-                col_conta_b = next((c for c in df_budget.columns if c in ['CONTA', 'CONTA SAP', 'CÓDIGO', 'CTA.CONTÁB./CÓD.PN']), None)
-                df_budget["CONTA"] = df_budget[col_conta_b].astype(str).str.strip() if col_conta_b else "Sem Conta"
-                df_budget["Nome da Conta"] = df_budget.iloc[:, 2].astype(str).str.strip() if len(df_budget.columns) >= 3 else df_budget["CONTA"]
+    # Aplicar filtros
+    df = df_raw.copy()
+    if ano_sel != "Todos":   df = df[df["Ano"] == ano_sel]
+    if mes_sel != "Todos":   df = df[df["Mes"] == mes_sel]
+    if conta_sel != "Todas": df = df[df["Conta"] == conta_sel]
+    if cc_sel != "Todos":    df = df[df["CentroCusto"].replace("", "(sem centro)") == cc_sel]
 
-            return df_lanc, df_budget
-            
-        except Exception as e:
-            logger.error(f"Erro no pipeline ETL: {e}")
-            return pd.DataFrame(), pd.DataFrame()
+    if df.empty:
+        st.info("Nenhum dado para os filtros selecionados.")
+        return
 
-    def inserir_lancamento(self, payload: dict) -> bool:
-        try:
-            sheet = self.client.open_by_url(self.url_banco)
-            worksheet = sheet.worksheet("Query 2025")
-            cabecalhos = worksheet.row_values(1)
-            nova_linha = [payload.get(col, "") for col in cabecalhos]
-            worksheet.append_row(nova_linha)
-            self.extrair_dados.clear()
-            return True
-        except Exception as e:
-            logger.error(f"Falha de gravação DML: {e}")
-            return False
+    # Agregações
+    df_mes = (df.groupby("Mes", as_index=False)
+               .agg(Budget=("Budget","sum"), Realizado=("Realizado","sum"), Delta=("Delta","sum"))
+               .sort_values("Mes", key=lambda s: s.map(mes_order)))
+    df_contas = (df.groupby("Conta", as_index=False)
+                  .agg(Budget=("Budget","sum"), Realizado=("Realizado","sum"), Delta=("Delta","sum")))
+    df_cc = (df[df["CentroCusto"] != ""].groupby("CentroCusto", as_index=False)
+              .agg(Budget=("Budget","sum"), Realizado=("Realizado","sum"))
+              .sort_values("Realizado", ascending=False))
 
-# --- 3. CAMADA DE INTERFACE E LÓGICA DE NEGÓCIOS ---
-def formatar_moeda(valor: float) -> str:
-    if pd.isna(valor): return "R$ 0,00"
-    return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+    tot_budget    = df_mes["Budget"].sum()
+    tot_realizado = df_mes["Realizado"].sum()
+    tot_delta     = df_mes["Delta"].sum()
+    pct_exec      = tot_realizado / tot_budget * 100 if tot_budget > 0 else 0
 
-def renderizar_kpis(b_atual, l_atual, b_prev, mrr_input, rotulo_comparativo):
-    tot_orc_kpi = b_atual["Orçado"].sum()
-    
-    # Prioridade Máxima: Extrai Realizado e Receita nativos da aba Budget filtrada
-    tot_real_kpi = b_atual["Realizado_Fisico"].sum()
-    mrr_val = b_atual["Receita_Fisica"].sum()
+    # ── ABAS ─────────────────────────────────────────────────────────────────
+    tab_geral, tab_contas, tab_centro, tab_mrr = st.tabs([
+        "📊 Visão Geral", "📋 Por Conta", "🏢 Centro de Custo", "📈 MRR vs Custo"
+    ])
 
-    # Fallbacks estruturais caso a aba Budget esteja sem colunas preenchidas
-    if tot_real_kpi == 0: 
-        tot_real_kpi = l_atual["Realizado"].sum()
-    if mrr_val == 0: 
-        mrr_val = mrr_input
-
-    pct_consumo_budget = (tot_real_kpi / tot_orc_kpi * 100) if tot_orc_kpi > 0 else 0.0
-    lucro_op = mrr_val - tot_real_kpi
-    margem_pct = (lucro_op / mrr_val * 100) if mrr_val > 0 else 0.0
-    delta_real_vs_orc = f"{((tot_real_kpi - tot_orc_kpi) / tot_orc_kpi) * 100:+.1f}% vs Orçamento" if tot_orc_kpi > 0 else None
-
-    tot_orc_prev = b_prev["Orçado"].sum() if not b_prev.empty else 0.0
-    delta_orc_pct = f"{((tot_orc_kpi - tot_orc_prev) / tot_orc_prev * 100):+.1f}% {rotulo_comparativo}" if tot_orc_prev > 0 else None
-
-    st.markdown("##### 💼 Demonstrativo de Resultados (P&L)")
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Receita Declarada (Aba Budget)", formatar_moeda(mrr_val))
-    k2.metric("Custos Totais Realizados", formatar_moeda(tot_real_kpi), delta=delta_real_vs_orc, delta_color="inverse")
-    k3.metric("Lucro Operacional Estimado", formatar_moeda(lucro_op), delta=f"{margem_pct:.1f}% de Margem", delta_color="normal")
-
-    st.markdown("##### 🎯 Consumo de Budget Global")
-    b1, b2, b3 = st.columns(3)
-    b1.metric("Orçamento Total (Aba Budget)", formatar_moeda(tot_orc_kpi), delta=delta_orc_pct, delta_color="off")
-    b2.metric("Saldo Disponível em Caixa", formatar_moeda(tot_orc_kpi - tot_real_kpi), "Estouro" if (tot_orc_kpi - tot_real_kpi) < 0 else "OK", delta_color="normal")
-    with b3:
-        st.markdown(f"**Burn Rate:** `{pct_consumo_budget:.1f}%`")
-        st.progress(min(pct_consumo_budget / 100, 1.0))
-    return tot_real_kpi, lucro_op
-
-def main():
-    HASH_SENHA, URL_BANCO_DADOS = SecurityManager.validar_ambiente()
-    SecurityManager.requerer_autenticacao(HASH_SENHA)
-
-    repo = FinanceRepository(URL_BANCO_DADOS)
-    df_lanc, df_budget = repo.extrair_dados()
-
-    tab_dash, tab_form = st.tabs(["👔 Visão Executiva (CFO)", "📥 Inserir Lançamento"])
-
-    with tab_dash:
-        if df_lanc.empty and df_budget.empty:
-            st.warning("Banco de dados vazio ou inacessível.")
-            return
-
-        st.markdown("### 🎛️ Motor de Filtros Analíticos")
-        anos_disponiveis = sorted([a for a in df_budget["Ano"].dropna().unique() if str(a).isdigit()], reverse=True) or [str(datetime.now().year)]
-
-        col_f1, col_f2, col_f3, col_f4 = st.columns([1.5, 1, 1.5, 2])
-        with col_f1: tipo_visao = st.radio("📊 Análise:", ["Mensal", "Anual Consolidada"], horizontal=True)
-        with col_f2: ano_alvo = st.selectbox("📅 Ano:", anos_disponiveis)
-        with col_f3:
-            if tipo_visao == "Mensal":
-                meses_disp = sorted([m for m in df_budget[df_budget["Ano"] == ano_alvo]["Competência"].dropna().unique() if '/' in str(m)])
-                mes_alvo = st.selectbox("📆 Mês:", meses_disp, index=len(meses_disp)-1 if meses_disp else 0)
-            else:
-                mes_alvo = "Todos"
-                st.info(f"Consolidado ({ano_alvo})")
-        with col_f4:
-            mrr_input = st.number_input(f"💰 Receita Manual (Fallback)", min_value=0.0, format="%.2f")
+    # ══════════════════════════════════════════════════════
+    # ABA 1 — VISÃO GERAL
+    # ══════════════════════════════════════════════════════
+    with tab_geral:
+        # KPIs
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            kpi_card("Total Budget", fmt_brl(tot_budget), f"{len(df_mes)} meses")
+        with k2:
+            cor = "red" if tot_realizado > tot_budget else "green"
+            kpi_card("Total Realizado", fmt_brl(tot_realizado),
+                     f"{pct_exec:.1f}% executado", cor)
+        with k3:
+            cor = "green" if tot_delta >= 0 else "red"
+            sinal = "+" if tot_delta >= 0 else ""
+            kpi_card("Delta (Economia)", f"{sinal}{fmt_brl(tot_delta)}",
+                     "Abaixo do budget ✓" if tot_delta >= 0 else "Acima do budget ⚠️", cor)
+        with k4:
+            mes_maior = df_mes.loc[df_mes["Realizado"].idxmax(), "Mes"] if not df_mes.empty else "—"
+            kpi_card("Maior Realizado", mes_maior,
+                     fmt_brl(df_mes["Realizado"].max()) if not df_mes.empty else "—")
 
         st.markdown("---")
 
-        mask_b = df_budget["Competência"] == mes_alvo if tipo_visao == "Mensal" else df_budget["Ano"] == ano_alvo
-        mask_l = df_lanc["Competência"] == mes_alvo if tipo_visao == "Mensal" else df_lanc["Ano"] == ano_alvo
-        b_atual, l_atual = df_budget[mask_b], df_lanc[mask_l]
+        # Gráfico principal — toggle barras/linha
+        modo = st.radio("Tipo de gráfico", ["Barras", "Linha"], horizontal=True, key="modo_chart")
+        if modo == "Barras":
+            st.plotly_chart(chart_bar_bvr(df_mes), use_container_width=True)
+        else:
+            st.plotly_chart(chart_linha_bvr(df_mes), use_container_width=True)
 
-        b_prev, rotulo_comparativo = pd.DataFrame(), ""
-        if tipo_visao == "Mensal" and 'meses_disp' in locals() and mes_alvo in meses_disp:
-            idx = meses_disp.index(mes_alvo)
-            if idx > 0:
-                b_prev = df_budget[df_budget["Competência"] == meses_disp[idx - 1]]
-                rotulo_comparativo = f"vs Ant. ({meses_disp[idx - 1]})"
-        elif tipo_visao == "Anual Consolidada" and ano_alvo in anos_disponiveis:
-            idx = anos_disponiveis.index(ano_alvo)
-            if idx + 1 < len(anos_disponiveis):
-                b_prev = df_budget[df_budget["Ano"] == anos_disponiveis[idx + 1]]
-                rotulo_comparativo = f"vs Ant. ({anos_disponiveis[idx + 1]})"
+        # Delta
+        st.plotly_chart(chart_delta(df_mes), use_container_width=True)
 
-        # KPIs Alimentados prioritariamente pela aba Budget
-        tot_real_kpi, lucro_op = renderizar_kpis(b_atual, l_atual, b_prev, mrr_input, rotulo_comparativo)
+    # ══════════════════════════════════════════════════════
+    # ABA 2 — POR CONTA
+    # ══════════════════════════════════════════════════════
+    with tab_contas:
+        st.plotly_chart(chart_contas(df_contas), use_container_width=True)
         st.markdown("---")
+        st.markdown("##### Detalhamento por Conta")
 
-        # Processamento da Matriz Unificada usando colunas calculadas do Budget
-        b_grp = b_atual.groupby(["CONTA", "Nome da Conta"], as_index=False)[["Orçado", "Realizado_Fisico"]].sum()
-        b_grp.rename(columns={"Realizado_Fisico": "Realizado_Budget"}, inplace=True)
-        
-        l_grp = l_atual.groupby("CONTA", as_index=False)["Realizado"].sum()
-        
-        df_bi = pd.merge(b_grp, l_grp, on="CONTA", how="outer").fillna({"Orçado": 0, "Realizado_Budget": 0, "Realizado": 0})
-        df_bi = df_bi[(df_bi["Orçado"] != 0) | (df_bi["Realizado_Budget"] != 0) | (df_bi["Realizado"] != 0)]
-        
-        # Consolida para visualização: Usa o Realizado do Budget. Se zerado, assume o Realizado dos Lançamentos físicos.
-        df_bi["Realizado_Final"] = np.where(df_bi["Realizado_Budget"] > 0, df_bi["Realizado_Budget"], df_bi["Realizado"])
-        df_bi["Nome da Conta"] = np.where(df_bi["Nome da Conta"].isna() | (df_bi["Nome da Conta"] == 0), df_bi["CONTA"], df_bi["Nome da Conta"])
-        df_bi["Saldo"] = df_bi["Orçado"] - df_bi["Realizado_Final"]
+        df_contas["% Exec"] = np.where(
+            df_contas["Budget"] > 0,
+            (df_contas["Realizado"] / df_contas["Budget"] * 100), 0)
+        df_contas["Status"] = np.select(
+            [df_contas["Realizado"] > df_contas["Budget"],
+             df_contas["Realizado"] >= df_contas["Budget"] * 0.85],
+            ["🔴 Estourou", "🟡 Alerta"], default="🟢 OK")
 
-        c1, c2 = st.columns([3, 2])
-        with c1:
-            df_chart1 = df_bi.nlargest(10, "Realizado_Final")
-            fig_vs = px.bar(df_chart1, x="Nome da Conta", y=["Orçado", "Realizado_Final"], barmode="group", title="Orçamento vs Execução (Top 10)", color_discrete_map={"Orçado": "#1f77b4", "Realizado_Final": "#ff7f0e"})
-            fig_vs.update_layout(margin=dict(t=40, b=0, l=0, r=0), legend_title_text="")
-            st.plotly_chart(fig_vs, use_container_width=True)
-        with c2:
-            # Captura dinâmica da Receita calculada no motor de KPI
-            mrr_calculado = b_atual["Receita_Fisica"].sum() or mrr_input
-            fig_wf = go.Figure(go.Waterfall(
-                measure=["relative", "relative", "total"], x=["Receita", "Custos", "Resultado"], y=[mrr_calculado, -tot_real_kpi, lucro_op],
-                text=[f"R$ {mrr_calculado:,.0f}", f"R$ {-tot_real_kpi:,.0f}", f"R$ {lucro_op:,.0f}"], textposition="outside",
-                decreasing={"marker": {"color": "#d62728"}}, increasing={"marker": {"color": "#2ca02c"}}, totals={"marker": {"color": "#1f77b4"}}
-            ))
-            fig_wf.update_layout(title="Formação do Resultado", margin=dict(t=40, b=0, l=0, r=0))
-            st.plotly_chart(fig_wf, use_container_width=True)
-
-        st.markdown("---")
-        st.markdown("##### 📋 Matriz de Custos com Drill-Down")
-        
-        df_bi["% Uso do Budget"] = np.where(df_bi["Orçado"] > 0, (df_bi["Realizado_Final"] / df_bi["Orçado"]) * 100, np.where(df_bi["Realizado_Final"] > 0, 100.0, 0))
-        mrr_global = b_atual["Receita_Fisica"].sum() or mrr_input
-        df_bi["% Consumo da Receita"] = np.where(mrr_global > 0, (df_bi["Realizado_Final"] / mrr_global) * 100, 0)
-        
-        df_bi["Status"] = np.select(
-            [df_bi["Realizado_Final"] > df_bi["Orçado"], df_bi["Realizado_Final"] >= df_bi["Orçado"] * 0.85, (df_bi["Orçado"] == 0) & (df_bi["Realizado_Final"] == 0)],
-            ["🔴 Estourou", "🟡 Alerta", "⚪ Sem Movimento"], default="🟢 OK"
-        )
-        df_view = df_bi[["Status", "CONTA", "Nome da Conta", "Orçado", "Realizado_Final", "Saldo", "% Uso do Budget", "% Consumo da Receita"]].sort_values("Realizado_Final", ascending=False).reset_index(drop=True)
-        df_view.rename(columns={"Realizado_Final": "Realizado"}, inplace=True)
-
-        event = st.dataframe(
-            df_view, selection_mode="single-row", on_select="rerun", key="grid_matriz", hide_index=True, use_container_width=True,
+        st.dataframe(
+            df_contas[["Status","Conta","Budget","Realizado","Delta","% Exec"]]
+              .sort_values("Realizado", ascending=False).reset_index(drop=True),
+            hide_index=True, use_container_width=True,
             column_config={
-                "CONTA": None, "Status": st.column_config.TextColumn("Alerta"), "Nome da Conta": st.column_config.TextColumn("Conta"),
-                "Orçado": st.column_config.NumberColumn("Budget", format="R$ %.2f"), "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
-                "Saldo": st.column_config.NumberColumn("Saldo", format="R$ %.2f"),
-                "% Uso do Budget": st.column_config.ProgressColumn("🔥 Consumo", format="%.1f%%", min_value=0, max_value=100),
-                "% Consumo da Receita": st.column_config.ProgressColumn("Peso Receita", format="%.2f%%", min_value=0, max_value=100)
+                "Status":    st.column_config.TextColumn("Alerta", width="small"),
+                "Conta":     st.column_config.TextColumn("Conta"),
+                "Budget":    st.column_config.NumberColumn("Budget",    format="R$ %.2f"),
+                "Realizado": st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
+                "Delta":     st.column_config.NumberColumn("Delta",     format="R$ %.2f"),
+                "% Exec":    st.column_config.ProgressColumn("Execução", format="%.1f%%", min_value=0, max_value=100),
             }
         )
 
-        if event and event.selection.rows:
-            linha_sel = df_view.iloc[event.selection.rows[0]]
-            st.markdown(f"###### 🔎 Detalhamento: `{linha_sel['Nome da Conta']}`")
-            
-            colunas_alvo = ["Competência", "Fornecedor", "CENTRO DE CUSTO", "Realizado", "OBSERVAÇÕES"]
-            colunas_seguras = [c for c in colunas_alvo if c in l_atual.columns]
-            
-            df_drill = l_atual[l_atual["CONTA"] == linha_sel["CONTA"]][colunas_seguras].dropna(axis=1, how='all')
-            
-            if not df_drill.empty:
-                st.dataframe(df_drill.sort_values("Realizado", ascending=False), hide_index=True, use_container_width=True, column_config={"Realizado": st.column_config.NumberColumn("Valor", format="R$ %.2f")})
+    # ══════════════════════════════════════════════════════
+    # ABA 3 — CENTRO DE CUSTO
+    # ══════════════════════════════════════════════════════
+    with tab_centro:
+        if df_cc.empty:
+            st.info("Nenhum Centro de Custo detectado na aba Budget (coluna 'Centro de Custo').")
+        else:
+            # KPIs de centro
+            tot_cc_r = df_cc["Realizado"].sum()
+            k1, k2, k3, k4 = st.columns(4)
+            with k1: kpi_card("Centros Ativos", str(len(df_cc)), "com Facilities")
+            with k2: kpi_card("Realizado Total", fmt_brl(tot_cc_r))
+            with k3:
+                maior = df_cc.iloc[0]
+                kpi_card("Maior Centro", maior["CentroCusto"][:20], fmt_brl(maior["Realizado"]))
+            with k4:
+                menor = df_cc.iloc[-1]
+                kpi_card("Menor Centro", menor["CentroCusto"][:20], fmt_brl(menor["Realizado"]))
+
+            st.markdown("---")
+
+            # Toggle: juntos / separados
+            modo_cc = st.radio("Visualização", ["Juntos", "Separados"], horizontal=True, key="modo_cc")
+
+            if modo_cc == "Juntos":
+                st.plotly_chart(chart_centros(df_cc), use_container_width=True)
             else:
-                st.info("Nenhum lançamento físico detectado em Query 2025 para este período (Métricas extraídas via Planejamento de Budget).")
+                # Mini-gráficos individuais por centro
+                centros = df_cc["CentroCusto"].tolist()
+                cols_mini = st.columns(min(3, len(centros)))
+                for i, centro in enumerate(centros):
+                    df_mini = df[df["CentroCusto"] == centro].groupby("Mes", as_index=False).agg(
+                        Budget=("Budget","sum"), Realizado=("Realizado","sum"))
+                    df_mini = df_mini.sort_values("Mes", key=lambda s: s.map(mes_order))
+                    fig_mini = go.Figure()
+                    fig_mini.add_bar(name="Budget",    x=df_mini["Mes"], y=df_mini["Budget"],
+                                     marker_color=COR_BUDGET,    marker_line_width=0)
+                    fig_mini.add_bar(name="Realizado", x=df_mini["Mes"], y=df_mini["Realizado"],
+                                     marker_color=COR_REALIZADO, marker_line_width=0)
+                    layout_mini = {**PLOTLY_LAYOUT, "barmode":"group", "height":200,
+                                   "title":dict(text=centro[:24], font=dict(size=11, color="#e6edf3")),
+                                   "showlegend": False,
+                                   "margin": dict(t=30, b=4, l=4, r=4)}
+                    fig_mini.update_layout(**layout_mini)
+                    with cols_mini[i % 3]:
+                        st.plotly_chart(fig_mini, use_container_width=True)
 
-    with tab_form:
-        st.markdown("### Lançamento Unitário no ERP")
-        with st.form("form_dml", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                data_mes = st.date_input("Mês da Competência *")
-                conta_sap = st.text_input("Cta.contáb./cód.PN *", max_chars=50)
-                fornecedor = st.text_input("Fornecedor *", max_chars=100)
-            with c2:
-                centro_custo = st.text_input("Centro de Custo", max_chars=50)
-                valor_deb_cred = st.number_input("Débito/crédito (MC) (R$) *", format="%.2f")
-                observacoes = st.text_input("Observações", max_chars=255)
+            st.markdown("---")
+            st.markdown("##### Tabela por Centro de Custo")
+            df_cc_tab = df_cc.copy()
+            df_cc_tab["Delta"]  = df_cc_tab["Budget"] - df_cc_tab["Realizado"]
+            df_cc_tab["% Exec"] = np.where(
+                df_cc_tab["Budget"] > 0,
+                df_cc_tab["Realizado"] / df_cc_tab["Budget"] * 100, 0)
+            st.dataframe(
+                df_cc_tab[["CentroCusto","Budget","Realizado","Delta","% Exec"]]
+                  .sort_values("Realizado", ascending=False).reset_index(drop=True),
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "CentroCusto": st.column_config.TextColumn("Centro de Custo"),
+                    "Budget":      st.column_config.NumberColumn("Budget",    format="R$ %.2f"),
+                    "Realizado":   st.column_config.NumberColumn("Realizado", format="R$ %.2f"),
+                    "Delta":       st.column_config.NumberColumn("Delta",     format="R$ %.2f"),
+                    "% Exec":      st.column_config.ProgressColumn("Execução", format="%.1f%%", min_value=0, max_value=100),
+                }
+            )
 
-            if st.form_submit_button("🚀 Inserir Linha", use_container_width=True):
-                conta_sap_san = SecurityManager.sanitizar_input(conta_sap)
-                fornecedor_san = SecurityManager.sanitizar_input(fornecedor)
-                
-                if not conta_sap_san or not fornecedor_san:
-                    st.error("🚨 Entradas inválidas: Campos obrigatórios ausentes.")
-                else:
-                    with st.spinner("Gravando e gerando trilha de auditoria..."):
-                        payload = {
-                            "Mês": data_mes.strftime("%Y-%m-%d"), "Cta.contáb./cód.PN": conta_sap_san,
-                            "Débito/crédito (MC)": str(valor_deb_cred).replace(".", ","), "Observações": SecurityManager.sanitizar_input(observacoes),
-                            "Fornecedor": fornecedor_san, "Centro de Custo": SecurityManager.sanitizar_input(centro_custo),
-                            "FORNECEDOR": fornecedor_san, "Cta.contáb./cód.PN 2": conta_sap_san, "Conta Contabil": conta_sap_san
-                        }
-                        if repo.inserir_lancamento(payload):
-                            st.success("✅ Lançamento auditado e inserido com sucesso.")
+    # ══════════════════════════════════════════════════════
+    # ABA 4 — MRR VS CUSTO
+    # ══════════════════════════════════════════════════════
+    with tab_mrr:
+        if df_mrr.empty:
+            st.info("Aba MRR não encontrada ou sem dados.")
+        else:
+            df_mrr_fil = df_mrr.copy()
+            if ano_sel != "Todos":
+                df_mrr_fil = df_mrr_fil[df_mrr_fil["Mes"].str.endswith(ano_sel[2:])]
+
+            merged = pd.merge(df_mrr_fil, df_mes[["Mes","Realizado"]], on="Mes", how="inner")
+            if merged.empty:
+                st.info("Sem sobreposição de meses entre MRR e Budget Facilities.")
+            else:
+                merged["% Custo/MRR"] = np.where(
+                    merged["MRR"] > 0,
+                    merged["Realizado"] / merged["MRR"] * 100, 0)
+
+                # KPIs MRR
+                k1, k2, k3 = st.columns(3)
+                with k1: kpi_card("MRR Médio", fmt_brl(merged["MRR"].mean()))
+                with k2: kpi_card("% Médio Facilities/MRR", f"{merged['% Custo/MRR'].mean():.2f}%")
+                with k3: kpi_card("HC Médio", str(int(df_mrr_fil["HC"].mean())) if "HC" in df_mrr_fil else "—")
+
+                st.markdown("---")
+                st.plotly_chart(chart_mrr(df_mrr_fil, df_mes), use_container_width=True)
+                st.markdown("---")
+                st.dataframe(
+                    merged[["Mes","MRR","Realizado","% Custo/MRR"]].sort_values("Mes", key=lambda s: s.map(mes_order)).reset_index(drop=True),
+                    hide_index=True, use_container_width=True,
+                    column_config={
+                        "Mes":          st.column_config.TextColumn("Mês"),
+                        "MRR":          st.column_config.NumberColumn("MRR", format="R$ %.2f"),
+                        "Realizado":    st.column_config.NumberColumn("Facilities", format="R$ %.2f"),
+                        "% Custo/MRR":  st.column_config.ProgressColumn("% Custo/MRR", format="%.2f%%", min_value=0, max_value=10),
+                    }
+                )
 
 if __name__ == "__main__":
     main()
