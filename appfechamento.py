@@ -187,9 +187,14 @@ def fmt_brl(v):
 
 # ─── AUTENTICAÇÃO ─────────────────────────────────────────────────────────────
 def check_auth():
+    # Aceita tanto senha em texto plano quanto hash bcrypt no secrets.toml
+    # secrets.toml: senha_app = "cobli@1609"  ← texto plano funciona
     senha_cfg = st.secrets.get("senha_app", "")
     if not senha_cfg:
-        st.error("⚠️ `senha_app` não configurada em secrets.toml")
+        # Tenta também a chave "senha_app_hash" para compatibilidade
+        senha_cfg = st.secrets.get("senha_app_hash", "")
+    if not senha_cfg:
+        st.error("⚠️ Configure `senha_app` no secrets.toml  →  senha_app = \"sua_senha\"")
         st.stop()
 
     if st.session_state.get("auth_ok"):
@@ -208,11 +213,16 @@ def check_auth():
 
         senha = st.text_input("Senha", type="password", placeholder="Digite a senha de acesso")
         if st.button("Entrar", use_container_width=True):
-            import bcrypt
-            try:
-                ok = bcrypt.checkpw(senha.encode(), senha_cfg.encode())
-            except Exception:
-                # Fallback: comparação direta (senha em texto plano no secrets)
+            ok = False
+            # 1. Tenta bcrypt (hash começando com $2b$ ou $2a$)
+            if senha_cfg.startswith("$2"):
+                try:
+                    import bcrypt
+                    ok = bcrypt.checkpw(senha.encode("utf-8"), senha_cfg.encode("utf-8"))
+                except Exception:
+                    ok = False
+            # 2. Texto plano — comparação direta
+            if not ok:
                 ok = (senha == senha_cfg)
             if ok:
                 st.session_state["auth_ok"] = True
