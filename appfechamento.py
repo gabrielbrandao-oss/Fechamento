@@ -371,7 +371,7 @@ def fig_cc_empilhado_mes(df_qg, meses_ord):
     for i, cc in enumerate(centros):
         sub = df_qg[df_qg["CentroCusto"]==cc].groupby("Mes")["Valor"].sum().reindex(meses_ord, fill_value=0)
         fig.add_bar(name=cc, x=meses_ord, y=sub.values,
-                    marker_color=PALETTE[i%len(PALETTE)], marker_line_width=0, stackgroup="cc")
+                    marker_color=PALETTE[i%len(PALETTE)], marker_line_width=0)
     fig.update_layout(**PLOTLY_BASE, barmode="stack",
                       title=title_layout("Realizado por Mês — empilhado por Centro"))
     return fig
