@@ -250,12 +250,15 @@ def load_budget(_cli, url):
     records = []
     for r in data[1:]:
         def get(i): return r[i].strip() if i < len(r) else ""
-        tipo = get(i_tipo).lower()
-        if tipo and tipo != "facilities":
+        # Sem filtro por TIPO: Budget inclui Facilities + IT & Softwares + Third-party Services
+        # O filtro Facilities já é feito na Query Geral (coluna O)
+        # Linhas completamente vazias são ignoradas
+        if not get(i_mes) and not get(i_bud):
             continue
         records.append({
             "_mes_raw":  get(i_mes),
             "Conta":     get(i_conta),
+            "Tipo":      get(i_tipo),
             "_bud_raw":  get(i_bud),
             "_real_raw": get(i_real),
             "_dlt_raw":  get(i_delta),
@@ -273,7 +276,8 @@ def load_budget(_cli, url):
     df["Realizado"]= df["_real_raw"].apply(parse_num)
     df["Delta"]    = df["_dlt_raw"].apply(parse_num)
 
-    return df[["Mes","Ano","Conta","Budget","Realizado","Delta"]].dropna(subset=["Mes"])
+    df["Tipo"] = df["Tipo"].astype(str).str.strip()
+    return df[["Mes","Ano","Conta","Tipo","Budget","Realizado","Delta"]].dropna(subset=["Mes"])
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -481,7 +485,7 @@ def main():
     anos_all = sorted(set(anos_bud+anos_qg), reverse=True)
     anos_all = [a for a in anos_all if str(a).isdigit()]
 
-    c1,c2,c3,c4,c5 = st.columns([.9,1.1,1.4,1.4,1])
+    c1,c2,c3,c4,c5,c6 = st.columns([.8,1,1.2,1.3,1.2,.9])
     with c1:
         ano = st.selectbox("Ano", ["Todos"]+anos_all,
                            index=1 if "2026" in anos_all else 0)
@@ -491,22 +495,28 @@ def main():
         meses = sorted(set(df_bud_a["Mes"].dropna()) | set(df_qg_a["Mes"].dropna()), key=mes_ord)
         mes = st.selectbox("Mês", ["Todos"]+meses)
     with c3:
-        contas = sorted(set(df_bud_a["Conta"].dropna()) | set(df_qg_a["Conta"].dropna()))
-        conta = st.selectbox("Conta", ["Todas"]+contas)
+        # Filtro de Tipo (Facilities / IT & Softwares / Third-party Services / Todos)
+        tipos_disp = sorted(df_bud_a["Tipo"].dropna().unique()) if not df_bud_a.empty else []
+        tipo_sel = st.selectbox("Tipo", ["Todos"]+tipos_disp)
     with c4:
-        ccs = sorted(df_qg_a["CentroCusto"].dropna().unique()) if not df_qg_a.empty else []
-        cc_sel = st.selectbox("Centro de Custo (col P)", ["Todos"]+ccs)
+        df_bud_at = df_bud_a[df_bud_a["Tipo"]==tipo_sel] if tipo_sel!="Todos" else df_bud_a
+        contas = sorted(set(df_bud_at["Conta"].dropna()) | set(df_qg_a["Conta"].dropna()))
+        conta = st.selectbox("Conta", ["Todas"]+contas)
     with c5:
+        ccs = sorted(df_qg_a["CentroCusto"].dropna().unique()) if not df_qg_a.empty else []
+        cc_sel = st.selectbox("Centro de Custo", ["Todos"]+ccs)
+    with c6:
         if st.button("↺ Atualizar", use_container_width=True):
             st.cache_data.clear(); st.rerun()
 
     # Aplicar filtros
     fb = df_bud.copy()
     fq = df_qg.copy()
-    if ano   != "Todos":  fb=fb[fb["Ano"]==ano];   fq=fq[fq["Ano"]==ano]
-    if mes   != "Todos":  fb=fb[fb["Mes"]==mes];   fq=fq[fq["Mes"]==mes]
-    if conta != "Todas":  fb=fb[fb["Conta"]==conta];fq=fq[fq["Conta"]==conta]
-    if cc_sel!= "Todos":  fq=fq[fq["CentroCusto"]==cc_sel]
+    if ano      != "Todos": fb=fb[fb["Ano"]==ano];         fq=fq[fq["Ano"]==ano]
+    if mes      != "Todos": fb=fb[fb["Mes"]==mes];         fq=fq[fq["Mes"]==mes]
+    if tipo_sel != "Todos": fb=fb[fb["Tipo"]==tipo_sel]
+    if conta    != "Todas": fb=fb[fb["Conta"]==conta];     fq=fq[fq["Conta"]==conta]
+    if cc_sel   != "Todos": fq=fq[fq["CentroCusto"]==cc_sel]
 
     if fb.empty and fq.empty:
         st.info("Nenhum dado para os filtros selecionados."); return
