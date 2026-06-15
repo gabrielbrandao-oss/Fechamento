@@ -176,35 +176,43 @@ def get_client():
 def load_query_geral(_cli, url):
     """
     Query Geral → lançamentos realizados de Facilities
-      A=Mês  N(14)=Conta  O(15)=filtro(Facilities)  P(16)=Centro de Custo  D(4)=Valor
+    Acesso por ÍNDICE de coluna (evita problema de colunas duplicadas no cabeçalho):
+      col 0  (A) = Mês
+      col 3  (D) = Débito/crédito (MC) = Valor realizado
+      col 13 (N) = Conta Contabil
+      col 14 (O) = Centro de Custo 2 → filtro "Facilities"
+      col 15 (P) = Pacote 2          → Centro de Custo do dashboard
     """
     ws   = _cli.open_by_url(url).worksheet("Query Geral")
     data = ws.get_all_values()
     if len(data) < 2: return pd.DataFrame()
 
-    df = pd.DataFrame(data[1:], columns=data[0])
-    # Posições exatas confirmadas pelo XLSX
-    # A=col0  D=col3  N=col13  O=col14  P=col15
-    cols_needed = {0:"_mes_raw", 3:"_valor_raw", 13:"Conta", 14:"_tipo", 15:"CentroCusto"}
-    rename = {}
-    for idx, name in cols_needed.items():
-        if idx < len(df.columns):
-            rename[df.columns[idx]] = name
-    df = df.rename(columns=rename)
+    rows = data[1:]  # ignora cabeçalho — acessa por índice
+    records = []
+    for r in rows:
+        # Garantir que a linha tem colunas suficientes
+        def get(i): return r[i].strip() if i < len(r) else ""
+        tipo = get(14).lower()  # col O: deve ser "facilities"
+        if tipo != "facilities":
+            continue
+        records.append({
+            "_mes_raw":   get(0),
+            "_valor_raw": get(3),
+            "Conta":      get(13),
+            "CentroCusto": get(15) or "(sem centro)",
+        })
 
-    # Garantir que as colunas existam
-    for c in ["_mes_raw","_valor_raw","Conta","_tipo","CentroCusto"]:
-        if c not in df.columns: df[c] = ""
+    if not records:
+        return pd.DataFrame(columns=["Mes","Ano","Conta","CentroCusto","Valor"])
 
-    # Filtrar: coluna O = "Facilities" (case-insensitive)
-    df = df[df["_tipo"].str.strip().str.lower() == "facilities"].copy()
-
-    df["_dt"]    = pd.to_datetime(df["_mes_raw"], errors="coerce")
-    df["Mes"]    = df["_dt"].apply(fmt_mes)
-    df["Ano"]    = df["_dt"].dt.year.astype("Int64").astype(str)
-    df["Valor"]  = df["_valor_raw"].apply(parse_num)
-    df["Conta"]  = df["Conta"].astype(str).str.strip()
-    df["CentroCusto"] = df["CentroCusto"].astype(str).str.strip().replace("","(sem centro)")
+    df = pd.DataFrame(records)
+    df["_dt"]  = pd.to_datetime(df["_mes_raw"], errors="coerce")
+    df["Mes"]  = df["_dt"].apply(fmt_mes)
+    df["Ano"]  = df["_dt"].dt.year.astype("Int64").astype(str)
+    df["Valor"] = df["_valor_raw"].apply(parse_num)
+    df["Conta"] = df["Conta"].astype(str).str.strip()
+    df["CentroCusto"] = df["CentroCusto"].astype(str).str.strip()
+    df.loc[df["CentroCusto"]=="", "CentroCusto"] = "(sem centro)"
 
     return df[["Mes","Ano","Conta","CentroCusto","Valor"]].dropna(subset=["Mes"])
 
@@ -212,34 +220,58 @@ def load_query_geral(_cli, url):
 @st.cache_data(ttl=60, show_spinner=False)
 def load_budget(_cli, url):
     """
-    Budget → orçamento oficial
-      A=Mês  C=TIPO1(conta)  D=Budget  E=Realizado  F=Delta  G=TIPO(filtro Facilities)
+    Budget → orçamento oficial. Acesso por ÍNDICE (sem depender de cabeçalho):
+      col 0 (A) = MÊS
+      col 2 (C) = TIPO 1 (nome da conta)
+      col 3 (D) = BUDGET
+      col 4 (E) = REALIZADO
+      col 5 (F) = DELTA
+      col 6 (G) = TIPO → filtro "Facilities"
     """
     ws   = _cli.open_by_url(url).worksheet("Budget")
     data = ws.get_all_values()
     if len(data) < 2: return pd.DataFrame()
 
-    df = pd.DataFrame(data[1:], columns=data[0])
-    df.columns = df.columns.str.strip().str.upper()
+    # Detecta índices pelo cabeçalho com fallback para posição fixa
+    hdr = [str(v).strip().upper() for v in data[0]]
+    def idx(names, fallback):
+        for n in names:
+            try: return hdr.index(n)
+            except ValueError: pass
+        return fallback
 
-    col_mes  = next((c for c in df.columns if c in ["MÊS","MES","DATA"]),None)
-    col_tipo = next((c for c in df.columns if c == "TIPO"),None)
-    # Colunas D/E/F por posição (índice 3/4/5) — confirmadas pelo XLSX
-    col_b, col_r, col_d = df.columns[3], df.columns[4], df.columns[5]
-    col_conta = next((c for c in df.columns if c == "TIPO 1"),None)
+    i_mes   = idx(["MÊS","MES","DATA"], 0)
+    i_conta = idx(["TIPO 1"], 2)
+    i_bud   = idx(["BUDGET"], 3)
+    i_real  = idx(["REALIZADO"], 4)
+    i_delta = idx(["DELTA"], 5)
+    i_tipo  = idx(["TIPO"], 6)
 
-    if not col_mes: return pd.DataFrame()
+    records = []
+    for r in data[1:]:
+        def get(i): return r[i].strip() if i < len(r) else ""
+        tipo = get(i_tipo).lower()
+        if tipo and tipo != "facilities":
+            continue
+        records.append({
+            "_mes_raw":  get(i_mes),
+            "Conta":     get(i_conta),
+            "_bud_raw":  get(i_bud),
+            "_real_raw": get(i_real),
+            "_dlt_raw":  get(i_delta),
+        })
 
-    if col_tipo:
-        df = df[df[col_tipo].str.strip().str.lower() == "facilities"].copy()
+    if not records:
+        return pd.DataFrame(columns=["Mes","Ano","Conta","Budget","Realizado","Delta"])
 
-    df["_dt"]      = pd.to_datetime(df[col_mes], errors="coerce")
+    df = pd.DataFrame(records)
+    df["_dt"]      = pd.to_datetime(df["_mes_raw"], errors="coerce")
     df["Mes"]      = df["_dt"].apply(fmt_mes)
     df["Ano"]      = df["_dt"].dt.year.astype("Int64").astype(str)
-    df["Conta"]    = df[col_conta].astype(str).str.strip() if col_conta else ""
-    df["Budget"]   = df[col_b].apply(parse_num)
-    df["Realizado"]= df[col_r].apply(parse_num)
-    df["Delta"]    = df[col_d].apply(parse_num)
+    df["Conta"]    = df["Conta"].astype(str).str.strip()
+    df["Budget"]   = df["_bud_raw"].apply(parse_num)
+    df["Realizado"]= df["_real_raw"].apply(parse_num)
+    df["Delta"]    = df["_dlt_raw"].apply(parse_num)
 
     return df[["Mes","Ano","Conta","Budget","Realizado","Delta"]].dropna(subset=["Mes"])
 
@@ -250,15 +282,25 @@ def load_mrr(_cli, url):
         ws   = _cli.open_by_url(url).worksheet("MRR")
         data = ws.get_all_values()
         if len(data) < 2: return pd.DataFrame()
-        df = pd.DataFrame(data[1:], columns=data[0])
-        df.columns = df.columns.str.strip().str.upper()
-        cm = next((c for c in df.columns if c in ["DATA","DATE","MÊS","MES"]),None)
-        cr = next((c for c in df.columns if "MRR" in c),None)
-        ch = next((c for c in df.columns if c == "HC"),None)
-        if not cm or not cr: return pd.DataFrame()
-        df["Mes"] = pd.to_datetime(df[cm], errors="coerce").apply(fmt_mes)
-        df["MRR"] = df[cr].apply(parse_num)
-        df["HC"]  = pd.to_numeric(df[ch], errors="coerce").fillna(0) if ch else 0
+        hdr = [str(v).strip().upper() for v in data[0]]
+        def idx(names, fallback):
+            for n in names:
+                try: return hdr.index(n)
+                except ValueError: pass
+            return fallback
+        i_mrr  = idx(["R$ MRR","MRR"], 0)
+        i_data = idx(["DATA","DATE","MÊS","MES"], 1)
+        i_hc   = idx(["HC"], 2)
+        records = []
+        for r in data[1:]:
+            def get(i): return r[i].strip() if i < len(r) else ""
+            records.append({
+                "_dt_raw": get(i_data),
+                "MRR":     parse_num(get(i_mrr)),
+                "HC":      parse_num(get(i_hc)),
+            })
+        df = pd.DataFrame(records)
+        df["Mes"] = pd.to_datetime(df["_dt_raw"], errors="coerce").apply(fmt_mes)
         return df[["Mes","MRR","HC"]].dropna(subset=["Mes"])
     except Exception as e:
         logger.warning(f"MRR: {e}"); return pd.DataFrame()
